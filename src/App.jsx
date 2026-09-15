@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Home, CalendarDays, ListChecks, Brain, Moon, X, Sparkles, Send,
   ChevronLeft, ChevronRight, Check, AlertTriangle, TrendingUp, Info,
-  Droplets, Bed, Smile, Activity, Loader2, PlusCircle, Map, Flame, LogOut,
+  Droplets, Bed, Smile, Activity, Loader2, PlusCircle, Map, Flame, LogOut, Upload,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 import {
@@ -368,6 +368,7 @@ const TABS = [
   { id: "progress", label: "Progresso",   icon: TrendingUp },
   { id: "ai",       label: "AI Lab",      icon: Brain },
   { id: "recovery", label: "Recovery",    icon: Moon },
+  { id: "import",   label: "Importar",    icon: Upload },
 ];
 
 function TrainingApp({ session, onSignOut }) {
@@ -460,6 +461,21 @@ function TrainingApp({ session, onSignOut }) {
     });
   }
 
+  // Recebe uma lista de sessões já resolvidas (vindas do Garmin CSV ou do
+  // histórico de conversa) e grava cada uma — atualizando a sessão planejada
+  // correspondente quando existe, ou criando uma sessão extra quando não há
+  // treino planejado naquele dia/modalidade.
+  async function importSessions(rows) {
+    setSessions(prev => {
+      const map = new Map(prev.map(s => [s.instanceId, s]));
+      for (const row of rows) map.set(row.instanceId, { ...(map.get(row.instanceId) || {}), ...row });
+      return Array.from(map.values());
+    });
+    for (const row of rows) {
+      try { await upsertSession(row); } catch (e) { console.error(e); setSyncError("Falha ao salvar alguns itens importados no Supabase."); }
+    }
+  }
+
   if (!ready) {
     return (
       <div className="icc-root" style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: 400 }}>
@@ -518,6 +534,7 @@ function TrainingApp({ session, onSignOut }) {
           {tab === "progress" && <ProgressView sessions={sessions} />}
           {tab === "ai" && <AILabView sessions={sessions} recovery={recovery} />}
           {tab === "recovery" && <RecoveryView recovery={recovery} onUpdate={updateRecovery} />}
+          {tab === "import" && <ImportView sessions={sessions} onImportSessions={importSessions} />}
         </div>
       </div>
 
@@ -1101,13 +1118,17 @@ function CourseView() {
         IRONMAN 70.3 Curitiba-Paraná · Passaúna → Araucária → Parque Barigui
       </div>
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 22 }}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 22, flexWrap: "wrap" }}>
         {Object.entries(COURSE).map(([key, v]) => (
           <button key={key} className="icc-btn" onClick={() => setSeg(key)}
             style={{ display: "flex", alignItems: "center", gap: 7, ...(seg === key ? { borderColor: v.color, color: v.color } : {}) }}>
             <span>{DISCIPLINES[key].icon}</span> {DISCIPLINES[key].label}
           </button>
         ))}
+        <a href="https://unlimitedsports.com.br/percursos-ironman-70-3-curitiba/" target="_blank" rel="noreferrer"
+          className="icc-btn" style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 7, textDecoration: "none", color: "var(--gold)", borderColor: "var(--gold)" }}>
+          Ver mapas oficiais (Unlimited Sports) ↗
+        </a>
       </div>
 
       <div className="icc-card" style={{ padding: 22, marginBottom: 18 }}>
@@ -1129,7 +1150,7 @@ function CourseView() {
         </div>
 
         <div style={{ marginTop: 16, fontSize: 11, color: "var(--text-faint)" }}>
-          Esquema ilustrativo baseado nas informações públicas do evento — não é o mapa oficial em GPS. Consulte o manual do atleta para o traçado exato.
+          Esquema ilustrativo baseado nas informações públicas do evento — para o mapa oficial com GPS e elevação exata, veja o link "Ver mapas oficiais" acima (organização Unlimited Sports).
         </div>
       </div>
     </div>
@@ -1417,6 +1438,282 @@ function SliderField({ label, value, onChange }) {
     <div>
       <label className="icc-label">{label} — {value}/5</label>
       <input type="range" min={1} max={5} value={value} onChange={e => onChange(+e.target.value)} style={{ width: "100%", accentColor: "var(--gold)" }} />
+    </div>
+  );
+}
+
+/* --------------------------------- Import ---------------------------------- */
+// Duas formas de trazer dados de fora sem a IA inventar nada: CSV exportado do
+// Garmin Connect, e um histórico de conversa (texto colado) analisado pela IA
+// — mas sempre com uma tela de revisão antes de qualquer coisa ser salva.
+
+function parseCSV(text) {
+  const rows = [];
+  let row = [], field = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i], next = text[i + 1];
+    if (inQuotes) {
+      if (c === '"' && next === '"') { field += '"'; i++; }
+      else if (c === '"') { inQuotes = false; }
+      else field += c;
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ",") { row.push(field); field = ""; }
+      else if (c === "\n" || c === "\r") {
+        if (field !== "" || row.length > 0) { row.push(field); rows.push(row); row = []; field = ""; }
+        if (c === "\r" && next === "\n") i++;
+      } else field += c;
+    }
+  }
+  if (field !== "" || row.length > 0) { row.push(field); rows.push(row); }
+  if (rows.length === 0) return [];
+  const headers = rows[0].map(h => h.trim());
+  return rows.slice(1).filter(r => r.length > 1).map(r => {
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = (r[i] || "").trim(); });
+    return obj;
+  });
+}
+
+function guessDiscipline(activityType) {
+  const t = (activityType || "").toLowerCase();
+  if (t.includes("nata") || t.includes("swim") || t.includes("pool")) return "swim";
+  if (t.includes("ciclis") || t.includes("bike") || t.includes("cycl")) return "bike";
+  if (t.includes("corrida") || t.includes("run")) return "run";
+  if (t.includes("força") || t.includes("forca") || t.includes("strength") || t.includes("academia")) return "strength";
+  return null;
+}
+
+function parseGarminNumber(str) {
+  if (!str) return null;
+  const n = parseFloat(String(str).replace(/\./g, "").replace(",", "."));
+  return isNaN(n) ? null : n;
+}
+
+function parseGarminDuration(str) {
+  // aceita "1:05:32" ou "45:12" ou "45min"
+  if (!str) return null;
+  const parts = String(str).split(":").map(Number);
+  if (parts.some(isNaN)) return null;
+  if (parts.length === 3) return Math.round(parts[0] * 60 + parts[1] + parts[2] / 60);
+  if (parts.length === 2) return Math.round(parts[0] + parts[1] / 60);
+  return null;
+}
+
+function ImportView({ sessions, onImportSessions }) {
+  const [sub, setSub] = useState("garmin");
+  return (
+    <div style={{ padding: "36px 28px 60px", maxWidth: 900 }}>
+      <div className="icc-display" style={{ fontSize: 24, marginBottom: 4 }}>Importar</div>
+      <div style={{ fontSize: 13, color: "var(--text-muted)", marginBottom: 22 }}>
+        Traga dados de fora do app — sempre com revisão antes de salvar, nada entra sem você conferir.
+      </div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 22 }}>
+        <button className="icc-btn" onClick={() => setSub("garmin")} style={sub==="garmin" ? {borderColor:"var(--gold)", color:"var(--gold)"} : {}}>Garmin (CSV)</button>
+        <button className="icc-btn" onClick={() => setSub("history")} style={sub==="history" ? {borderColor:"var(--gold)", color:"var(--gold)"} : {}}>Histórico de conversa</button>
+      </div>
+      {sub === "garmin" ? <GarminCsvImport sessions={sessions} onImportSessions={onImportSessions} /> : <HistoryImport sessions={sessions} onImportSessions={onImportSessions} />}
+    </div>
+  );
+}
+
+function GarminCsvImport({ sessions, onImportSessions }) {
+  const [rows, setRows] = useState([]); // review rows
+  const [saved, setSaved] = useState(false);
+  const inputRef = useRef(null);
+
+  function handleFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setSaved(false);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const records = parseCSV(String(reader.result));
+      const built = records.map((r, i) => {
+        const activityType = r["Tipo de atividade"] || r["Activity Type"] || "";
+        const dateStr = r["Data"] || r["Date"] || "";
+        const date = parseGarminDate(dateStr);
+        const discipline = guessDiscipline(activityType) || "run";
+        const durationMin = parseGarminDuration(r["Tempo"] || r["Time"] || r["Duração"]);
+        const distanceKm = parseGarminNumber(r["Distância"] || r["Distance"]);
+        const hrAvg = parseGarminNumber(r["FC média"] || r["Avg HR"]);
+        const match = date ? sessions.find(s => s.date === date && s.discipline === discipline) : null;
+        return {
+          rowId: `g${i}`, include: !!date, date: date || "", discipline,
+          durationMin: durationMin || "", distanceKm: distanceKm || "", hrAvg: hrAvg || "",
+          matchInstanceId: match ? match.instanceId : null, activityType,
+        };
+      }).filter(r => r.date);
+      setRows(built);
+    };
+    reader.readAsText(file, "utf-8");
+  }
+
+  function updateRow(rowId, patch) {
+    setRows(prev => prev.map(r => r.rowId === rowId ? { ...r, ...patch } : r));
+  }
+
+  function save() {
+    const toSave = rows.filter(r => r.include).map(r => {
+      const durationMin = +r.durationMin || 0, distanceKm = r.distanceKm === "" ? null : +r.distanceKm;
+      const pace = r.discipline === "run" ? formatPaceMinKm(durationMin, distanceKm) : r.discipline === "swim" ? formatSwimPace(durationMin, distanceKm) : null;
+      const speedKmh = r.discipline === "bike" && distanceKm ? +(distanceKm / (durationMin / 60)).toFixed(1) : null;
+      const day = (fromISODate(r.date).getDay() + 6) % 7;
+      const instanceId = r.matchInstanceId || `garmin_${r.date}_${r.discipline}_${r.rowId}`;
+      return {
+        instanceId, templateId: null, date: r.date, day, time: "00:00", discipline: r.discipline,
+        durationMin: durationMin, distanceKm, zone: null, desc: "Importado do Garmin",
+        status: "completed",
+        actual: { durationMin, distanceKm, pace, speedKmh, hrAvg: r.hrAvg === "" ? null : +r.hrAvg, power: null, cadence: null, elevationM: null, rpe: null, sensation: null, notes: `Importado do Garmin (${r.activityType})`, nutrition: "", isDemo: false },
+        missedReason: null, missedNote: null,
+      };
+    });
+    onImportSessions(toSave);
+    setSaved(true);
+  }
+
+  return (
+    <div>
+      <div className="icc-card" style={{ padding: 20, marginBottom: 18 }}>
+        <div className="icc-label" style={{ margin: 0 }}>COMO EXPORTAR DO GARMIN CONNECT</div>
+        <div style={{ fontSize: 12.5, color: "var(--text-muted)", marginTop: 8, lineHeight: 1.6 }}>
+          O Garmin não oferece uma sincronização automática de graça para apps pessoais — a API oficial deles é só para empresas aprovadas.
+          O caminho que funciona: no site connect.garmin.com → "Atividades" → selecione as atividades → "Exportar CSV". Depois suba o
+          arquivo aqui. Pode repetir isso periodicamente (ex: 1x por semana).
+        </div>
+        <button className="icc-btn icc-btn-gold" style={{ marginTop: 14 }} onClick={() => inputRef.current?.click()}>Selecionar arquivo CSV</button>
+        <input ref={inputRef} type="file" accept=".csv" style={{ display: "none" }} onChange={handleFile} />
+      </div>
+
+      {rows.length > 0 && (
+        <div className="icc-card" style={{ padding: 20 }}>
+          <div className="icc-label" style={{ margin: 0 }}>REVISAR ANTES DE SALVAR ({rows.length} atividades encontradas)</div>
+          <div className="icc-scroll" style={{ maxHeight: 420, overflowY: "auto", marginTop: 12 }}>
+            {rows.map(r => (
+              <div key={r.rowId} style={{ display: "flex", gap: 10, alignItems: "center", padding: "8px 0", borderBottom: "1px solid var(--line)" }}>
+                <input type="checkbox" checked={r.include} onChange={e => updateRow(r.rowId, { include: e.target.checked })} />
+                <div style={{ width: 90, fontSize: 12 }}>{r.date}</div>
+                <select className="icc-select" style={{ width: 120 }} value={r.discipline} onChange={e => updateRow(r.rowId, { discipline: e.target.value })}>
+                  {Object.keys(DISCIPLINES).map(k => <option key={k} value={k}>{DISCIPLINES[k].label}</option>)}
+                </select>
+                <input className="icc-input" style={{ width: 80 }} placeholder="min" value={r.durationMin} onChange={e => updateRow(r.rowId, { durationMin: e.target.value })} />
+                <input className="icc-input" style={{ width: 80 }} placeholder="km" value={r.distanceKm} onChange={e => updateRow(r.rowId, { distanceKm: e.target.value })} />
+                <input className="icc-input" style={{ width: 80 }} placeholder="FC" value={r.hrAvg} onChange={e => updateRow(r.rowId, { hrAvg: e.target.value })} />
+                <div style={{ fontSize: 11, color: r.matchInstanceId ? "var(--green)" : "var(--text-faint)" }}>
+                  {r.matchInstanceId ? "vincula a treino planejado" : "extra"}
+                </div>
+              </div>
+            ))}
+          </div>
+          <button className="icc-btn icc-btn-gold" style={{ marginTop: 16 }} onClick={save}>Salvar selecionados</button>
+          {saved && <span style={{ marginLeft: 12, fontSize: 12.5, color: "var(--green)" }}>Salvo!</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function parseGarminDate(str) {
+  if (!str) return null;
+  // formatos comuns: "2026-09-10 06:30:00", "10/09/2026 06:30", "2026-09-10"
+  const m1 = str.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (m1) return `${m1[1]}-${m1[2]}-${m1[3]}`;
+  const m2 = str.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+  if (m2) return `${m2[3]}-${m2[2]}-${m2[1]}`;
+  return null;
+}
+
+function HistoryImport({ sessions, onImportSessions }) {
+  const [text, setText] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [rows, setRows] = useState([]);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  async function extract() {
+    if (!text.trim()) return;
+    setLoading(true); setError(""); setSaved(false);
+    const prompt = `Este é um histórico de conversa entre um atleta e um assistente sobre os treinos dele. Extraia APENAS os treinos que
+foram explicitamente mencionados com dados concretos (data ou dia da semana relativo, modalidade, e pelo menos duração ou distância).
+NÃO invente nenhum valor que não esteja no texto — se um dado não aparecer, deixe null.
+
+Responda SOMENTE com um array JSON, sem texto antes ou depois, no formato:
+[{"date": "AAAA-MM-DD ou null se não souber", "discipline": "swim|bike|run|strength", "durationMin": numero ou null, "distanceKm": numero ou null, "rpe": numero ou null, "notes": "texto curto ou null"}]
+
+Hoje é ${todayISO()}, use isso para resolver datas relativas tipo "ontem" ou "terça passada".
+
+TEXTO:
+${text.slice(0, 12000)}`;
+    const result = await callClaude("Você extrai dados estruturados de texto sem nunca inventar valores ausentes.", prompt);
+    try {
+      const jsonMatch = result.match(/\[[\s\S]*\]/);
+      const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : result);
+      setRows(parsed.map((p, i) => ({ rowId: `h${i}`, include: !!(p.date && p.discipline), ...p })));
+      if (parsed.length === 0) setError("Não encontrei treinos com dados suficientes nesse texto.");
+    } catch (e) {
+      setError("Não consegui interpretar a resposta da IA. Tente colar um trecho menor ou mais específico.");
+    }
+    setLoading(false);
+  }
+
+  function updateRow(rowId, patch) {
+    setRows(prev => prev.map(r => r.rowId === rowId ? { ...r, ...patch } : r));
+  }
+
+  function save() {
+    const toSave = rows.filter(r => r.include && r.date && r.discipline).map(r => {
+      const durationMin = +r.durationMin || 0, distanceKm = r.distanceKm ? +r.distanceKm : null;
+      const day = (fromISODate(r.date).getDay() + 6) % 7;
+      const match = sessions.find(s => s.date === r.date && s.discipline === r.discipline);
+      const instanceId = match ? match.instanceId : `historico_${r.date}_${r.discipline}_${r.rowId}`;
+      return {
+        instanceId, templateId: null, date: r.date, day, time: "00:00", discipline: r.discipline,
+        durationMin, distanceKm, zone: null, desc: "Importado do histórico de conversa",
+        status: "completed",
+        actual: { durationMin, distanceKm, pace: null, speedKmh: null, hrAvg: null, power: null, cadence: null, elevationM: null, rpe: r.rpe || null, sensation: null, notes: r.notes || "Importado do histórico de conversa", nutrition: "", isDemo: false },
+        missedReason: null, missedNote: null,
+      };
+    });
+    onImportSessions(toSave);
+    setSaved(true);
+  }
+
+  return (
+    <div>
+      <div className="icc-card" style={{ padding: 20, marginBottom: 18 }}>
+        <div className="icc-label" style={{ margin: 0 }}>COLE O HISTÓRICO DA CONVERSA</div>
+        <div style={{ fontSize: 12.5, color: "var(--text-muted)", marginTop: 6, marginBottom: 12 }}>
+          Copie e cole os trechos onde ele comentou sobre os treinos (data, modalidade, tempo/distância, como se sentiu). A IA só extrai
+          o que estiver escrito — nada é inventado, e nada é salvo até você revisar e clicar em "Salvar".
+        </div>
+        <textarea className="icc-textarea" rows={8} value={text} onChange={e => setText(e.target.value)} placeholder="Cole aqui..." />
+        <button className="icc-btn icc-btn-gold" style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6 }} onClick={extract} disabled={loading}>
+          {loading ? <Loader2 size={14} /> : <Sparkles size={14} />} Extrair treinos com IA
+        </button>
+        {error && <div style={{ fontSize: 12.5, color: "var(--amber)", marginTop: 10 }}>{error}</div>}
+      </div>
+
+      {rows.length > 0 && (
+        <div className="icc-card" style={{ padding: 20 }}>
+          <div className="icc-label" style={{ margin: 0 }}>REVISAR ANTES DE SALVAR</div>
+          <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+            {rows.map(r => (
+              <div key={r.rowId} style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", padding: "8px 0", borderBottom: "1px solid var(--line)" }}>
+                <input type="checkbox" checked={r.include} onChange={e => updateRow(r.rowId, { include: e.target.checked })} />
+                <input className="icc-input" style={{ width: 120 }} type="date" value={r.date || ""} onChange={e => updateRow(r.rowId, { date: e.target.value })} />
+                <select className="icc-select" style={{ width: 120 }} value={r.discipline || "run"} onChange={e => updateRow(r.rowId, { discipline: e.target.value })}>
+                  {Object.keys(DISCIPLINES).map(k => <option key={k} value={k}>{DISCIPLINES[k].label}</option>)}
+                </select>
+                <input className="icc-input" style={{ width: 80 }} placeholder="min" value={r.durationMin || ""} onChange={e => updateRow(r.rowId, { durationMin: e.target.value })} />
+                <input className="icc-input" style={{ width: 80 }} placeholder="km" value={r.distanceKm || ""} onChange={e => updateRow(r.rowId, { distanceKm: e.target.value })} />
+                <div style={{ fontSize: 11.5, color: "var(--text-faint)", flex: 1, minWidth: 140 }}>{r.notes}</div>
+              </div>
+            ))}
+          </div>
+          <button className="icc-btn icc-btn-gold" style={{ marginTop: 16 }} onClick={save}>Salvar selecionados</button>
+          {saved && <span style={{ marginLeft: 12, fontSize: 12.5, color: "var(--green)" }}>Salvo!</span>}
+        </div>
+      )}
     </div>
   );
 }
