@@ -525,8 +525,7 @@ function TrainingApp({ session, onSignOut }) {
       <div className="icc-main">
         <div className="icc-fade" key={tab}>
           {tab === "home" && (
-            <HomeView sessions={sessions} recovery={recovery} setTab={setTab}
-              photos={photos} onAddPhotos={addPhotos} onRemovePhoto={removePhoto} photoWarning={photoWarning} />
+            <HomeView sessions={sessions} recovery={recovery} setTab={setTab} photos={photos} />
           )}
           {tab === "today" && <TodayView sessions={sessions} onLog={setLogModal} onAnalyze={setAnalysisModal} />}
           {tab === "calendar" && <CalendarView sessions={sessions} onLog={setLogModal} onAnalyze={setAnalysisModal} />}
@@ -534,7 +533,10 @@ function TrainingApp({ session, onSignOut }) {
           {tab === "progress" && <ProgressView sessions={sessions} />}
           {tab === "ai" && <AILabView sessions={sessions} recovery={recovery} />}
           {tab === "recovery" && <RecoveryView recovery={recovery} onUpdate={updateRecovery} />}
-          {tab === "import" && <ImportView sessions={sessions} onImportSessions={importSessions} />}
+          {tab === "import" && (
+            <ImportView sessions={sessions} onImportSessions={importSessions}
+              photos={photos} onAddPhotos={addPhotos} onRemovePhoto={removePhoto} photoWarning={photoWarning} />
+          )}
         </div>
       </div>
 
@@ -713,7 +715,7 @@ function currentPhase(daysToRace) {
   return "BASE";
 }
 
-function HomeView({ sessions, recovery, setTab, photos, onAddPhotos, onRemovePhoto, photoWarning }) {
+function HomeView({ sessions, recovery, setTab, photos }) {
   const today = todayISO();
   const daysToRace = Math.ceil((fromISODate(RACE.date) - fromISODate(today)) / 86400000);
   const phase = currentPhase(daysToRace);
@@ -763,8 +765,6 @@ function HomeView({ sessions, recovery, setTab, photos, onAddPhotos, onRemovePho
             );
           })}
         </div>
-
-        <PhotoGallery photos={photos} onAddPhotos={onAddPhotos} onRemovePhoto={onRemovePhoto} warning={photoWarning} />
       </div>
     </div>
   );
@@ -1500,7 +1500,7 @@ function parseGarminDuration(str) {
   return null;
 }
 
-function ImportView({ sessions, onImportSessions }) {
+function ImportView({ sessions, onImportSessions, photos, onAddPhotos, onRemovePhoto, photoWarning }) {
   const [sub, setSub] = useState("garmin");
   return (
     <div style={{ padding: "36px 28px 60px", maxWidth: 900 }}>
@@ -1508,11 +1508,14 @@ function ImportView({ sessions, onImportSessions }) {
       <div style={{ fontSize: 13, color: "var(--text-muted)", marginBottom: 22 }}>
         Traga dados de fora do app — sempre com revisão antes de salvar, nada entra sem você conferir.
       </div>
-      <div style={{ display: "flex", gap: 8, marginBottom: 22 }}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 22, flexWrap: "wrap" }}>
         <button className="icc-btn" onClick={() => setSub("garmin")} style={sub==="garmin" ? {borderColor:"var(--gold)", color:"var(--gold)"} : {}}>Garmin (CSV)</button>
         <button className="icc-btn" onClick={() => setSub("history")} style={sub==="history" ? {borderColor:"var(--gold)", color:"var(--gold)"} : {}}>Histórico de conversa</button>
+        <button className="icc-btn" onClick={() => setSub("photos")} style={sub==="photos" ? {borderColor:"var(--gold)", color:"var(--gold)"} : {}}>Fotos</button>
       </div>
-      {sub === "garmin" ? <GarminCsvImport sessions={sessions} onImportSessions={onImportSessions} /> : <HistoryImport sessions={sessions} onImportSessions={onImportSessions} />}
+      {sub === "garmin" && <GarminCsvImport sessions={sessions} onImportSessions={onImportSessions} />}
+      {sub === "history" && <HistoryImport sessions={sessions} onImportSessions={onImportSessions} />}
+      {sub === "photos" && <PhotoGallery photos={photos} onAddPhotos={onAddPhotos} onRemovePhoto={onRemovePhoto} warning={photoWarning} />}
     </div>
   );
 }
