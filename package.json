@@ -12,10 +12,16 @@
     "@supabase/supabase-js": "^2.45.0",
     "lucide-react": "^0.383.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "recharts": "^2.12.7"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",
     "vite": "^5.4.0"
-  }
+  },
+  "description": "App de preparação para o IRONMAN 70.3 Curitiba-Paraná — banco de dados no Supabase, hospedagem na Vercel, código no GitHub. Feito para você e seu namorado acessarem com login (mais ninguém consegue entrar).",
+  "main": "vite.config.js",
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
 }
