@@ -324,6 +324,7 @@ function TrainingApp({ session, onSignOut }) {
   const [syncError, setSyncError] = useState("");
   const [photoWarning, setPhotoWarning] = useState("");
   const [logModal, setLogModal] = useState(null); // session being logged
+  const [adHocModal, setAdHocModal] = useState(false); // treino fora do plano
   const [analysisModal, setAnalysisModal] = useState(null); // session being analyzed
 
   // Load from Supabase on mount. A semana-modelo (plan_template) é semeada
@@ -490,6 +491,14 @@ function TrainingApp({ session, onSignOut }) {
     }
   }
 
+  // Treino fora do plano: reaproveita o mesmo caminho de importSessions —
+  // vira uma sessão "extra" (templateId null), sem depender de nenhum item
+  // da semana-modelo.
+  async function saveAdHocWorkout(row) {
+    await importSessions([row]);
+    setAdHocModal(false);
+  }
+
   if (!ready) {
     return (
       <div className="icc-root" style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: 400 }}>
@@ -541,10 +550,11 @@ function TrainingApp({ session, onSignOut }) {
           {tab === "home" && (
             <HomeView sessions={sessions} recovery={recovery} setTab={setTab} photos={photos} />
           )}
-          {tab === "today" && <TodayView sessions={sessions} onLog={setLogModal} onAnalyze={setAnalysisModal} />}
+          {tab === "today" && <TodayView sessions={sessions} onLog={setLogModal} onAnalyze={setAnalysisModal} onAddAdHoc={() => setAdHocModal(true)} />}
           {tab === "calendar" && (
             <CalendarView sessions={sessions} onLog={setLogModal} onAnalyze={setAnalysisModal}
-              template={template} onSaveTemplateEntry={saveTemplateEntry} onRemoveTemplateEntry={removeTemplateEntry} />
+              template={template} onSaveTemplateEntry={saveTemplateEntry} onRemoveTemplateEntry={removeTemplateEntry}
+              onAddAdHoc={() => setAdHocModal(true)} />
           )}
           {tab === "course" && <CourseView />}
           {tab === "progress" && <ProgressView sessions={sessions} />}
@@ -576,6 +586,10 @@ function TrainingApp({ session, onSignOut }) {
 
       {logModal && (
         <WorkoutLogModal session={logModal} onClose={() => setLogModal(null)} onSave={saveWorkoutLog}
+          onPhotoUploaded={record => setPhotos(prev => [record, ...prev])} />
+      )}
+      {adHocModal && (
+        <AdHocWorkoutModal onClose={() => setAdHocModal(false)} onSave={saveAdHocWorkout}
           onPhotoUploaded={record => setPhotos(prev => [record, ...prev])} />
       )}
       {analysisModal && (
@@ -941,7 +955,7 @@ function HeroStat({ label, value }) {
 
 /* --------------------------------- Today ---------------------------------- */
 
-function TodayView({ sessions, onLog, onAnalyze }) {
+function TodayView({ sessions, onLog, onAnalyze, onAddAdHoc }) {
   const today = todayISO();
   const todays = sessions.filter(s => s.date === today).sort((a,b) => a.time.localeCompare(b.time));
   const dayIdx = fromISODate(today).getDay();
@@ -949,10 +963,18 @@ function TodayView({ sessions, onLog, onAnalyze }) {
 
   return (
     <div style={{ padding: "36px 28px 60px", maxWidth: 760 }}>
-      <div style={{ fontSize: 12, letterSpacing: "0.06em", color: "var(--text-muted)", marginBottom: 6 }}>
-        HOJE — {dayLabel.toUpperCase()}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10 }}>
+        <div>
+          <div style={{ fontSize: 12, letterSpacing: "0.06em", color: "var(--text-muted)", marginBottom: 6 }}>
+            HOJE — {dayLabel.toUpperCase()}
+          </div>
+          <div className="icc-display" style={{ fontSize: 26 }}>{formatDateLong(today)}</div>
+        </div>
+        <button className="icc-btn" style={{ display: "flex", alignItems: "center", gap: 6 }} onClick={onAddAdHoc}>
+          <PlusCircle size={14} /> Lançar treino fora do plano
+        </button>
       </div>
-      <div className="icc-display" style={{ fontSize: 26, marginBottom: 30 }}>{formatDateLong(today)}</div>
+      <div style={{ height: 24 }} />
 
       {todays.length === 0 && (
         <div className="icc-card" style={{ padding: 24, color: "var(--text-muted)" }}>
@@ -1041,7 +1063,7 @@ function ActualSummary({ discipline, actual: a }) {
 
 /* -------------------------------- Calendar --------------------------------- */
 
-function CalendarView({ sessions, onLog, onAnalyze, template, onSaveTemplateEntry, onRemoveTemplateEntry }) {
+function CalendarView({ sessions, onLog, onAnalyze, template, onSaveTemplateEntry, onRemoveTemplateEntry, onAddAdHoc }) {
   const [weekOffset, setWeekOffset] = useState(0);
   const [editorOpen, setEditorOpen] = useState(false);
   const monday = addDays(getMonday(new Date()), weekOffset * 7);
@@ -1060,6 +1082,9 @@ function CalendarView({ sessions, onLog, onAnalyze, template, onSaveTemplateEntr
           </div>
           <button className="icc-btn" onClick={() => setWeekOffset(o => o + 1)}><ChevronRight size={14} /></button>
           {weekOffset !== 0 && <button className="icc-btn" onClick={() => setWeekOffset(0)}>Hoje</button>}
+          <button className="icc-btn" onClick={onAddAdHoc} style={{ marginLeft: 6, display: "flex", alignItems: "center", gap: 6 }}>
+            <PlusCircle size={14} /> Treino avulso
+          </button>
           <button className="icc-btn" onClick={() => setEditorOpen(true)} style={{ marginLeft: 6 }}>Editar semana-modelo</button>
         </div>
       </div>
@@ -1345,8 +1370,13 @@ function statsForRange(sessions, start, end) {
 }
 
 /* ---------------------------- Athlete avatar (gamification) ---------------------------- */
-// Nível calculado apenas a partir de sessões concluídas/parciais nas últimas 8 semanas —
-// nunca é a IA quem decide isso, é uma contagem direta dos seus registros reais.
+// Nível calculado a partir de dois fatores, ambos direto dos seus registros
+// reais — nunca é a IA quem decide isso:
+// 1) Consistência: treinos concluídos/parciais nas últimas 8 semanas (como antes).
+// 2) Performance: compara as últimas 4 semanas com as 4 anteriores — bônus se
+//    o volume (km) subiu e/ou se a FC média caiu para volume igual ou maior
+//    (sinal de melhora de condicionamento). Só soma pontos, nunca tira —
+//    piora de performance não derruba de nível, só deixa de dar o bônus.
 
 const AVATAR_LEVELS = [
   { min: 0,  label: "Recruta",     color: "var(--text-faint)" },
@@ -1356,19 +1386,55 @@ const AVATAR_LEVELS = [
   { min: 60, label: "Elite",       color: "var(--gold)" },
 ];
 
+function performanceBonus(sessions) {
+  const today = new Date();
+  const recentStart = toISODate(addDays(today, -4 * 7));
+  const priorStart = toISODate(addDays(today, -8 * 7));
+  const priorEnd = toISODate(addDays(today, -4 * 7 - 1));
+  const withData = s => (s.status === "completed" || s.status === "partial") && s.actual;
+
+  const recent = sessions.filter(s => s.date >= recentStart && withData(s));
+  const prior = sessions.filter(s => s.date >= priorStart && s.date <= priorEnd && withData(s));
+
+  const kmOf = arr => arr.reduce((a, s) => a + (s.actual.distanceKm || 0), 0);
+  const hrOf = arr => {
+    const list = arr.filter(s => s.actual.hrAvg).map(s => s.actual.hrAvg);
+    return list.length ? list.reduce((a, b) => a + b, 0) / list.length : null;
+  };
+
+  const recentKm = kmOf(recent), priorKm = kmOf(prior);
+  const recentHr = hrOf(recent), priorHr = hrOf(prior);
+
+  let volumeBonus = 0, volumeNote = null;
+  if (priorKm > 0) {
+    const change = (recentKm - priorKm) / priorKm;
+    if (change > 0) { volumeBonus = Math.min(8, Math.round(change * 20)); volumeNote = `+${Math.round(change * 100)}% de km nas últimas 4 semanas`; }
+  }
+
+  let efficiencyBonus = 0, efficiencyNote = null;
+  if (recentHr && priorHr && recentKm >= priorKm * 0.9) {
+    const change = (priorHr - recentHr) / priorHr;
+    if (change > 0) { efficiencyBonus = Math.min(6, Math.round(change * 40)); efficiencyNote = `FC média caiu ${Math.round(change * 100)}% para volume parecido ou maior`; }
+  }
+
+  return { volumeBonus, volumeNote, efficiencyBonus, efficiencyNote, total: volumeBonus + efficiencyBonus };
+}
+
 function computeAthleteXP(sessions) {
   const start = toISODate(addDays(new Date(), -8 * 7));
   const end = todayISO();
   const rel = sessions.filter(s => s.date >= start && s.date <= end);
   const completed = rel.filter(s => s.status === "completed").length;
   const partial = rel.filter(s => s.status === "partial").length;
-  const points = completed + partial * 0.5;
+  const consistencyPoints = completed + partial * 0.5;
+  const perf = performanceBonus(sessions);
+  const points = consistencyPoints + perf.total;
   let levelIdx = 0;
   for (let i = 0; i < AVATAR_LEVELS.length; i++) if (points >= AVATAR_LEVELS[i].min) levelIdx = i;
   const cur = AVATAR_LEVELS[levelIdx];
   const next = AVATAR_LEVELS[levelIdx + 1];
   const pct = next ? Math.min(100, Math.round(((points - cur.min) / (next.min - cur.min)) * 100)) : 100;
-  return { points: Math.round(points * 10) / 10, completed, partial, total: rel.length, levelIdx, cur, next, pct };
+  return { points: Math.round(points * 10) / 10, consistencyPoints, completed, partial, total: rel.length, levelIdx, cur, next, pct, perf };
 }
 
 function AthleteAvatarCard({ sessions }) {
@@ -1386,8 +1452,14 @@ function AthleteAvatarCard({ sessions }) {
           <div style={{ width: `${xp.pct}%`, height: "100%", background: xp.cur.color, transition: "width 0.6s ease" }} />
         </div>
         <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 6 }}>
-          {xp.next ? `Faltam treinos concluídos para virar "${xp.next.label}"` : "Nível máximo — continue mantendo a consistência"}
+          {xp.next ? `${xp.points}/${xp.next.min} pontos para virar "${xp.next.label}"` : "Nível máximo — continue mantendo a consistência e a evolução"}
         </div>
+        {xp.perf.total > 0 && (
+          <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 3 }}>
+            {xp.perf.volumeNote && <div style={{ fontSize: 11, color: "var(--green)" }}>▲ +{xp.perf.volumeBonus} pontos de performance — {xp.perf.volumeNote}</div>}
+            {xp.perf.efficiencyNote && <div style={{ fontSize: 11, color: "var(--green)" }}>▲ +{xp.perf.efficiencyBonus} pontos de performance — {xp.perf.efficiencyNote}</div>}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -2035,6 +2107,209 @@ function Field({ label, children }) {
   return <div><label className="icc-label">{label}</label>{children}</div>;
 }
 
+// Converte um Blob em base64 puro (sem o prefixo "data:...;base64,"), pro
+// formato que a API de imagens da Anthropic espera.
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("read failed"));
+    reader.onload = () => resolve(String(reader.result).split(",")[1]);
+    reader.readAsDataURL(blob);
+  });
+}
+
+const SCREENSHOT_EXTRACT_PROMPT = `Você vai analisar uma captura de tela de um app de treino (Strava, Garmin Connect ou similar).
+Extraia SOMENTE os dados que estão literalmente visíveis na imagem. Nunca estime, arredonde de forma inventada ou complete um valor que não apareça na tela — se não estiver visível, use null.
+Responda ESTRITAMENTE em JSON válido, sem nenhum texto antes ou depois, sem markdown, exatamente neste formato:
+{"discipline":"swim|bike|run|strength ou null","durationMin":number ou null,"distanceKm":number ou null,"hrAvg":number ou null,"cadence":number ou null,"power":number ou null,"elevationM":number ou null,"notes":"string curta ou null"}
+"discipline" deve ser exatamente uma destas strings: "swim", "bike", "run", "strength" — ou null se não der pra identificar. Números em formato number (use ponto decimal), nunca string. "notes" é opcional, só para algo textual relevante visível na tela (ex: nome da atividade).`;
+
+// Sobe o screenshot, pede pra IA extrair os campos visíveis, e devolve o
+// objeto já parseado — SEM tocar no formulário. Quem chama decide o que
+// fazer com o resultado (o usuário sempre revisa antes de salvar).
+async function extractWorkoutFromScreenshot(file) {
+  const blob = await compressImageToBlob(file, 1400, 0.85);
+  const base64 = await blobToBase64(blob);
+  const raw = await callClaudeVision(SCREENSHOT_EXTRACT_PROMPT, "Extraia os dados desta captura de tela de treino.", base64, "image/jpeg");
+  const cleaned = (raw || "").replace(/```json|```/g, "").trim();
+  return JSON.parse(cleaned);
+}
+
+// Bloco de UI reaproveitado pelo registro de treino comum e pelo avulso: um
+// botão que sobe uma foto do Strava/Garmin e preenche os campos com o que a
+// IA conseguiu ler — sempre como sugestão, nunca salva sozinho.
+function ScreenshotImportField({ onExtracted }) {
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+
+  async function handlePick(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setBusy(true);
+    setNote("");
+    try {
+      const parsed = await extractWorkoutFromScreenshot(file);
+      onExtracted(parsed);
+      setNote("Campos preenchidos a partir da imagem — confira cada um antes de salvar.");
+    } catch (err) {
+      console.error(err);
+      setNote("Não consegui ler os dados dessa imagem. Preencha manualmente.");
+    }
+    setBusy(false);
+    e.target.value = "";
+  }
+
+  return (
+    <Field label="Preencher a partir de um screenshot (Strava/Garmin) — opcional">
+      <label className="icc-btn" style={{ cursor: "pointer", margin: 0, display: "inline-flex", alignItems: "center", gap: 6 }}>
+        {busy ? <Loader2 size={13} /> : <Sparkles size={13} color="var(--gold)" />}
+        {busy ? "Lendo imagem…" : "Enviar screenshot"}
+        <input type="file" accept="image/*" style={{ display: "none" }} onChange={handlePick} disabled={busy} />
+      </label>
+      {note && <div style={{ fontSize: 11.5, color: "var(--text-muted)", marginTop: 8 }}>{note}</div>}
+    </Field>
+  );
+}
+
+// Registro de treino que não estava no plano (nenhum item correspondente na
+// semana-modelo). Vira uma sessão "extra" — data, horário e modalidade são
+// escolhidos aqui em vez de virem de uma sessão já existente.
+function AdHocWorkoutModal({ onClose, onSave, onPhotoUploaded }) {
+  const [meta, setMeta] = useState({ date: todayISO(), time: "12:00", discipline: "run" });
+  const [outcome, setOutcome] = useState("completed");
+  const [f, setF] = useState({
+    durationMin: "", distanceKm: "", hrAvg: "", power: "", cadence: "", elevationM: "",
+    rpe: 6, sensation: "Bom", notes: "", nutrition: "",
+  });
+  const [photoFile, setPhotoFile] = useState(null);
+  const [photoPreview, setPhotoPreview] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  const disc = meta.discipline;
+  const showDistance = disc !== "strength";
+  const showPower = disc === "bike";
+  const showCadence = disc === "bike" || disc === "run";
+  const showElevation = disc === "bike" || disc === "run";
+
+  function handlePhotoPick(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setPhotoFile(file);
+    setPhotoPreview(URL.createObjectURL(file));
+  }
+
+  function applyExtracted(parsed) {
+    if (parsed.discipline && DISCIPLINES[parsed.discipline]) setMeta(m => ({ ...m, discipline: parsed.discipline }));
+    setF(v => ({
+      ...v,
+      durationMin: parsed.durationMin ?? v.durationMin,
+      distanceKm: parsed.distanceKm ?? v.distanceKm,
+      hrAvg: parsed.hrAvg ?? v.hrAvg,
+      cadence: parsed.cadence ?? v.cadence,
+      power: parsed.power ?? v.power,
+      elevationM: parsed.elevationM ?? v.elevationM,
+      notes: parsed.notes ? [v.notes, parsed.notes].filter(Boolean).join(" — ") : v.notes,
+    }));
+  }
+
+  async function submit() {
+    setSaving(true);
+    let photoUrl = null;
+    if (photoFile) {
+      try {
+        const blob = await compressImageToBlob(photoFile);
+        const category = { swim: "Natação", bike: "Bike", run: "Corrida", strength: "Musculação" }[disc] || "Preparação";
+        const record = await uploadPhoto(blob, category);
+        photoUrl = record.dataUrl;
+        onPhotoUploaded?.(record);
+      } catch (e) { console.error(e); }
+    }
+    const distanceKm = f.distanceKm === "" ? null : +f.distanceKm;
+    const durationMin = f.durationMin === "" ? 0 : +f.durationMin;
+    const pace = disc === "run" ? formatPaceMinKm(durationMin, distanceKm) : disc === "swim" ? formatSwimPace(durationMin, distanceKm) : null;
+    const speedKmh = disc === "bike" && distanceKm ? +(distanceKm / (durationMin/60)).toFixed(1) : null;
+    const day = (fromISODate(meta.date).getDay() + 6) % 7;
+    const instanceId = `extra_${meta.date}_${disc}_${Date.now()}`;
+
+    await onSave({
+      instanceId, templateId: null, date: meta.date, day, time: meta.time, discipline: disc,
+      durationMin, distanceKm, zone: null, desc: "Treino fora do plano",
+      status: outcome,
+      actual: {
+        durationMin, distanceKm, pace, speedKmh,
+        hrAvg: f.hrAvg === "" ? null : +f.hrAvg,
+        power: f.power === "" ? null : +f.power,
+        cadence: f.cadence === "" ? null : +f.cadence,
+        elevationM: f.elevationM === "" ? null : +f.elevationM,
+        rpe: +f.rpe, sensation: f.sensation, notes: f.notes, nutrition: f.nutrition, photoUrl,
+      },
+      missedReason: null, missedNote: "",
+    });
+    setSaving(false);
+  }
+
+  return (
+    <ModalShell onClose={onClose} title="Lançar treino fora do plano" subtitle="Não precisa estar na semana-modelo — escolha os dados abaixo.">
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <Field label="Data"><input className="icc-input" type="date" value={meta.date} onChange={e => setMeta(m => ({ ...m, date: e.target.value }))} /></Field>
+          <Field label="Horário"><input className="icc-input" type="time" value={meta.time} onChange={e => setMeta(m => ({ ...m, time: e.target.value }))} /></Field>
+        </div>
+        <Field label="Modalidade">
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {Object.entries(DISCIPLINES).map(([key, d]) => (
+              <button key={key} className="icc-btn" style={disc === key ? { borderColor: d.color, color: d.color } : {}}
+                onClick={() => setMeta(m => ({ ...m, discipline: key }))}>{d.icon} {d.label}</button>
+            ))}
+          </div>
+        </Field>
+
+        <ScreenshotImportField onExtracted={applyExtracted} />
+
+        <div style={{ display: "flex", gap: 8 }}>
+          {["completed", "partial"].map(o => (
+            <button key={o} className="icc-btn" onClick={() => setOutcome(o)}
+              style={outcome === o ? { borderColor: "var(--gold)", color: "var(--gold)" } : {}}>
+              {o === "completed" ? "✅ Concluído" : "🟡 Parcial"}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <Field label="Duração (min)"><input className="icc-input" type="number" value={f.durationMin} onChange={e=>setF(v=>({...v,durationMin:e.target.value}))} /></Field>
+          {showDistance && <Field label="Distância (km)"><input className="icc-input" type="number" step="0.01" value={f.distanceKm} onChange={e=>setF(v=>({...v,distanceKm:e.target.value}))} /></Field>}
+          <Field label="FC média (bpm)"><input className="icc-input" type="number" value={f.hrAvg} onChange={e=>setF(v=>({...v,hrAvg:e.target.value}))} /></Field>
+          {showPower && <Field label="Potência (W)"><input className="icc-input" type="number" value={f.power} onChange={e=>setF(v=>({...v,power:e.target.value}))} /></Field>}
+          {showCadence && <Field label="Cadência"><input className="icc-input" type="number" value={f.cadence} onChange={e=>setF(v=>({...v,cadence:e.target.value}))} /></Field>}
+          {showElevation && <Field label="Elevação (m)"><input className="icc-input" type="number" value={f.elevationM} onChange={e=>setF(v=>({...v,elevationM:e.target.value}))} /></Field>}
+        </div>
+        <SliderField label="RPE (1-10)" value={f.rpe} onChange={v => setF(x=>({...x, rpe: v}))} />
+        <Field label="Sensação geral">
+          <select className="icc-select" value={f.sensation} onChange={e=>setF(v=>({...v,sensation:e.target.value}))}>
+            {SENSATIONS.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </Field>
+        <Field label="Alimentação / hidratação (opcional)"><input className="icc-input" value={f.nutrition} onChange={e=>setF(v=>({...v,nutrition:e.target.value}))} /></Field>
+        <Field label="Observações"><textarea className="icc-textarea" rows={3} value={f.notes} onChange={e=>setF(v=>({...v,notes:e.target.value}))} /></Field>
+        <Field label="Foto do treino (opcional)">
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            {photoPreview && <img src={photoPreview} alt="preview" style={{ width: 56, height: 56, objectFit: "cover", borderRadius: 4, border: "1px solid var(--line)" }} />}
+            <label className="icc-btn" style={{ cursor: "pointer", margin: 0 }}>
+              {photoPreview ? "Trocar foto" : "Adicionar foto"}
+              <input type="file" accept="image/*" style={{ display: "none" }} onChange={handlePhotoPick} />
+            </label>
+          </div>
+        </Field>
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 22 }}>
+        <button className="icc-btn" onClick={onClose}>Cancelar</button>
+        <button className="icc-btn icc-btn-gold" onClick={submit} disabled={saving}>{saving ? "Salvando…" : "Salvar treino"}</button>
+      </div>
+    </ModalShell>
+  );
+}
+
 function ModalShell({ title, subtitle, onClose, children, wide }) {
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(4,5,6,0.72)", zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} onClick={onClose}>
@@ -2071,6 +2346,19 @@ async function callClaude(system, userPrompt) {
   } catch (e) {
     return "Não foi possível conectar à IA agora. Tente novamente em instantes.";
   }
+}
+
+// Mesma rota serverless, mas manda uma imagem em base64 junto do prompt —
+// usada pra ler screenshots de treino (Strava/Garmin) e extrair dados.
+async function callClaudeVision(system, userPrompt, imageBase64, imageMediaType) {
+  const res = await fetch("/api/claude", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ system, prompt: userPrompt, image: imageBase64, imageMediaType }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(typeof data.error === "string" ? data.error : "Erro na API");
+  return (data.content || []).map(b => b.text || "").join("\n").trim();
 }
 
 const AI_GUARDRAILS = `
