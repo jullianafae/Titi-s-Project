@@ -15,7 +15,13 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { system, prompt } = req.body || {};
+    const { system, prompt, image, imageMediaType } = req.body || {};
+    const content = image
+      ? [
+          { type: "image", source: { type: "base64", media_type: imageMediaType || "image/jpeg", data: image } },
+          { type: "text", text: prompt },
+        ]
+      : prompt;
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -27,7 +33,7 @@ export default async function handler(req, res) {
         model: "claude-sonnet-4-6",
         max_tokens: 1000,
         system,
-        messages: [{ role: "user", content: prompt }],
+        messages: [{ role: "user", content }],
       }),
     });
     const data = await r.json();
