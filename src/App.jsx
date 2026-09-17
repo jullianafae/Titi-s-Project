@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Home, CalendarDays, ListChecks, Brain, Moon, X, Sparkles, Send,
   ChevronLeft, ChevronRight, Check, AlertTriangle, TrendingUp, Info,
-  Droplets, Bed, Smile, Activity, Loader2, PlusCircle, Map, Flame, LogOut, Upload,
+  Droplets, Bed, Smile, Activity, Loader2, PlusCircle, Map as MapIcon, Flame, LogOut, Upload,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 import {
@@ -299,7 +299,7 @@ const TABS = [
   { id: "home",     label: "Início",      icon: Home },
   { id: "today",    label: "Hoje",        icon: ListChecks },
   { id: "calendar", label: "Calendário",  icon: CalendarDays },
-  { id: "course",   label: "Percurso",    icon: Map },
+  { id: "course",   label: "Percurso",    icon: MapIcon },
   { id: "progress", label: "Progresso",   icon: TrendingUp },
   { id: "ai",       label: "AI Lab",      icon: Brain },
   { id: "recovery", label: "Recovery",    icon: Moon },
