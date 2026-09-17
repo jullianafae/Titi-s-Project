@@ -6,9 +6,10 @@ import {
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 import {
-  fetchSessions, bulkInsertSessions, upsertSession,
+  fetchSessions, upsertSession,
   fetchRecovery, bulkInsertRecovery, upsertRecovery,
   fetchPhotos, uploadPhoto, deletePhoto,
+  fetchTemplate, bulkInsertTemplate, upsertTemplateEntry, deleteTemplateEntry,
 } from "./db";
 
 /* =========================================================================
@@ -139,10 +140,11 @@ const DISCIPLINES = {
   strength: { label: "Musculação",  icon: "🏋️", color: "var(--strength)" },
 };
 
-// Estrutura-base fornecida pelo usuário (dia / horário / modalidade preservados
-// exatamente). Duração, distância e zona são placeholders de demonstração —
-// serão substituídos ao importar a planilha real.
-const BASE_WEEK = [
+// Semente inicial da semana-modelo (usada só uma vez, para popular a tabela
+// `plan_template` no Supabase quando ela está vazia). A partir daí, o
+// calendário passa a ser 100% editável pela interface — isto deixa de ser a
+// fonte de verdade.
+const DEFAULT_TEMPLATE = [
   { id: "mon-swim",     day: 0, time: "06:00", discipline: "swim",     durationMin: 60,  distanceKm: 2.0, zone: "Z2", desc: "Técnica + aeróbico" },
   { id: "mon-bike",     day: 0, time: "19:00", discipline: "bike",     durationMin: 75,  distanceKm: 30,  zone: "Z2", desc: "Endurance" },
   { id: "tue-run",      day: 1, time: "05:30", discipline: "run",      durationMin: 50,  distanceKm: 8,   zone: "Z2", desc: "Ritmo controlado" },
@@ -251,77 +253,10 @@ function compressImageToBlob(file, maxDim = 1400, quality = 0.78) {
 }
 
 /* -------------------------- Demo data generation ------------------------ */
-
-function genActual(rng, tmpl, factor = 1) {
-  const durationMin = Math.max(5, Math.round(tmpl.durationMin * factor * (1 + (rng() - 0.5) * 0.2)));
-  let distanceKm = null;
-  if (tmpl.distanceKm) distanceKm = +(tmpl.distanceKm * factor * (1 + (rng() - 0.5) * 0.12)).toFixed(2);
-
-  let pace = null, speedKmh = null, hrAvg = null, power = null, cadence = null, elevationM = null;
-  if (tmpl.discipline === "run") {
-    pace = formatPaceMinKm(durationMin, distanceKm);
-    hrAvg = Math.round(138 + rng() * 22);
-    cadence = Math.round(164 + rng() * 10);
-    elevationM = Math.round(20 + rng() * 120);
-  } else if (tmpl.discipline === "bike") {
-    speedKmh = distanceKm ? +(distanceKm / (durationMin / 60)).toFixed(1) : null;
-    hrAvg = Math.round(128 + rng() * 20);
-    power = Math.round(155 + rng() * 45);
-    cadence = Math.round(80 + rng() * 12);
-    elevationM = Math.round(80 + rng() * 400);
-  } else if (tmpl.discipline === "swim") {
-    pace = formatSwimPace(durationMin, distanceKm);
-    hrAvg = Math.round(120 + rng() * 18);
-  } else if (tmpl.discipline === "strength") {
-    hrAvg = Math.round(95 + rng() * 15);
-  }
-  const rpe = Math.min(10, Math.max(4, Math.round(4 + rng() * 5)));
-  const sensation = SENSATIONS[Math.min(4, Math.floor(rng() * 5))];
-  return {
-    durationMin, distanceKm, pace, speedKmh, hrAvg, power, cadence, elevationM,
-    rpe, sensation, notes: "", nutrition: "", actualTime: tmpl.time, isDemo: true,
-  };
-}
-
-function buildDemoLog() {
-  const rng = mulberry32(20260914);
-  const monday = getMonday(new Date());
-  const today = todayISO();
-  const sessions = [];
-
-  for (let wo = -6; wo <= 1; wo++) {
-    const weekStart = addDays(monday, wo * 7);
-    for (const tmpl of BASE_WEEK) {
-      const date = toISODate(addDays(weekStart, tmpl.day));
-      const instanceId = `${wo}_${tmpl.id}`;
-      let status = "planned", actual = null, missedReason = null, missedNote = "";
-
-      const isPast = date < today;
-      const isTodayEarlier = date === today && tmpl.time < "12:00";
-
-      if (wo < 0 || isPast || isTodayEarlier) {
-        const r = rng();
-        if (r < 0.07) {
-          status = "missed";
-          missedReason = MISSED_REASONS[Math.floor(rng() * MISSED_REASONS.length)];
-        } else if (r < 0.15) {
-          status = "partial";
-          actual = genActual(rng, tmpl, 0.55 + rng() * 0.2);
-        } else {
-          status = "completed";
-          actual = genActual(rng, tmpl, 1);
-        }
-      }
-
-      sessions.push({
-        instanceId, templateId: tmpl.id, date, day: tmpl.day, time: tmpl.time,
-        discipline: tmpl.discipline, durationMin: tmpl.durationMin, distanceKm: tmpl.distanceKm,
-        zone: tmpl.zone, desc: tmpl.desc, status, actual, missedReason, missedNote,
-      });
-    }
-  }
-  return sessions;
-}
+// A geração de treinos falsos (genActual/buildDemoLog) foi removida: o
+// calendário agora é sempre calculado a partir da tabela `plan_template` +
+// dos registros reais salvos, nunca inventado. A geração de recovery de
+// demonstração abaixo continua por enquanto (fora do escopo desta mudança).
 
 function buildDemoRecovery() {
   const rng = mulberry32(77);
@@ -371,9 +306,15 @@ const TABS = [
   { id: "import",   label: "Importar",    icon: Upload },
 ];
 
+// Quantas semanas para trás do calendário são geradas a partir do template
+// (o calendário nunca navega mais longe que isso no passado). Para a frente,
+// gera-se até a semana da prova (RACE.date).
+const TEMPLATE_WEEKS_BACK = 52;
+
 function TrainingApp({ session, onSignOut }) {
   const [tab, setTab] = useState("home");
-  const [sessions, setSessions] = useState([]);
+  const [template, setTemplate] = useState([]); // semana-modelo editável (tabela plan_template)
+  const [storedSessions, setStoredSessions] = useState([]); // só o que foi de fato registrado/importado
   const [recovery, setRecovery] = useState({});
   const [photos, setPhotos] = useState([]);
   const [ready, setReady] = useState(false);
@@ -382,18 +323,24 @@ function TrainingApp({ session, onSignOut }) {
   const [logModal, setLogModal] = useState(null); // session being logged
   const [analysisModal, setAnalysisModal] = useState(null); // session being analyzed
 
-  // Load from Supabase on mount — seed demo data the very first time the
-  // database is empty, so the app never opens blank.
+  // Load from Supabase on mount. A semana-modelo (plan_template) é semeada
+  // com DEFAULT_TEMPLATE só na primeira vez, se a tabela estiver vazia.
+  // As sessões, diferente de antes, NUNCA são geradas em massa — só existem
+  // no banco os treinos que foram de fato registrados, importados ou
+  // marcados como não realizados. Os treinos "planejados" são calculados na
+  // hora, combinando o template com esses registros reais (ver useMemo `sessions` abaixo).
   useEffect(() => {
     (async () => {
       try {
-        let loadedSessions = await fetchSessions();
-        if (loadedSessions.length === 0) {
-          const demo = buildDemoLog();
-          await bulkInsertSessions(demo);
-          loadedSessions = demo;
+        let loadedTemplate = await fetchTemplate();
+        if (loadedTemplate.length === 0) {
+          await bulkInsertTemplate(DEFAULT_TEMPLATE);
+          loadedTemplate = DEFAULT_TEMPLATE;
         }
-        setSessions(loadedSessions);
+        setTemplate(loadedTemplate);
+
+        const loadedSessions = await fetchSessions();
+        setStoredSessions(loadedSessions);
 
         let loadedRecovery = await fetchRecovery();
         if (Object.keys(loadedRecovery).length === 0) {
@@ -408,12 +355,54 @@ function TrainingApp({ session, onSignOut }) {
       } catch (e) {
         console.error(e);
         setSyncError("Não foi possível conectar ao Supabase. Verifique as variáveis de ambiente e a conexão.");
-        setSessions(buildDemoLog());
+        setTemplate(DEFAULT_TEMPLATE);
         setRecovery(buildDemoRecovery());
       }
       setReady(true);
     })();
   }, []);
+
+  // Combina a semana-modelo com os registros reais: cada dia/horário do
+  // template vira uma sessão "planejada" virtual, e é substituída pelo
+  // registro real quando existe (casando por data + id do template — não por
+  // instanceId, então isso funciona mesmo com registros antigos). Registros
+  // sem template correspondente (treinos extras, ou fora da janela abaixo)
+  // continuam aparecendo, como antes.
+  const sessions = useMemo(() => {
+    if (template.length === 0) return storedSessions;
+
+    const start = addDays(getMonday(new Date()), -TEMPLATE_WEEKS_BACK * 7);
+    const raceMonday = getMonday(fromISODate(RACE.date));
+    const end = raceMonday > getMonday(new Date()) ? raceMonday : getMonday(new Date());
+
+    const byKey = new Map();
+    const extras = [];
+    for (const s of storedSessions) {
+      if (s.templateId) byKey.set(`${s.date}::${s.templateId}`, s);
+      else extras.push(s);
+    }
+
+    const combined = [];
+    for (let weekStart = start; weekStart <= end; weekStart = addDays(weekStart, 7)) {
+      for (const tmpl of template) {
+        const date = toISODate(addDays(weekStart, tmpl.day));
+        const key = `${date}::${tmpl.id}`;
+        const stored = byKey.get(key);
+        if (stored) {
+          byKey.delete(key);
+          combined.push(stored);
+        } else {
+          combined.push({
+            instanceId: `${date}_${tmpl.id}`, templateId: tmpl.id, date, day: tmpl.day, time: tmpl.time,
+            discipline: tmpl.discipline, durationMin: tmpl.durationMin, distanceKm: tmpl.distanceKm,
+            zone: tmpl.zone, desc: tmpl.desc, status: "planned", actual: null, missedReason: null, missedNote: "",
+          });
+        }
+      }
+    }
+    // Registros reais que sobraram (fora da janela, ou cujo item do template foi removido depois) continuam visíveis.
+    return [...combined, ...extras, ...Array.from(byKey.values())];
+  }, [template, storedSessions]);
 
   async function addPhotos(fileList, category) {
     const files = Array.from(fileList || []).slice(0, 8);
@@ -436,12 +425,34 @@ function TrainingApp({ session, onSignOut }) {
   }
 
   function updateSession(instanceId, patch) {
-    setSessions(prev => {
-      const next = prev.map(s => s.instanceId === instanceId ? { ...s, ...patch } : s);
-      const updated = next.find(s => s.instanceId === instanceId);
-      if (updated) upsertSession(updated).catch(e => { console.error(e); setSyncError("Falha ao salvar no Supabase — a alteração pode não ter sido sincronizada."); });
-      return next;
+    const base = sessions.find(s => s.instanceId === instanceId);
+    if (!base) return;
+    const updated = { ...base, ...patch };
+    setStoredSessions(prev => {
+      const exists = prev.some(s => s.instanceId === instanceId);
+      return exists ? prev.map(s => s.instanceId === instanceId ? updated : s) : [...prev, updated];
     });
+    upsertSession(updated).catch(e => { console.error(e); setSyncError("Falha ao salvar no Supabase — a alteração pode não ter sido sincronizada."); });
+  }
+
+  async function saveTemplateEntry(entry) {
+    try {
+      await upsertTemplateEntry(entry);
+      setTemplate(prev => prev.some(t => t.id === entry.id) ? prev.map(t => t.id === entry.id ? entry : t) : [...prev, entry]);
+    } catch (e) {
+      console.error(e);
+      setSyncError("Falha ao salvar a semana-modelo no Supabase.");
+    }
+  }
+
+  async function removeTemplateEntry(id) {
+    try {
+      await deleteTemplateEntry(id);
+      setTemplate(prev => prev.filter(t => t.id !== id));
+    } catch (e) {
+      console.error(e);
+      setSyncError("Falha ao remover item da semana-modelo no Supabase.");
+    }
   }
 
   function saveWorkoutLog(instanceId, data) {
@@ -466,7 +477,7 @@ function TrainingApp({ session, onSignOut }) {
   // correspondente quando existe, ou criando uma sessão extra quando não há
   // treino planejado naquele dia/modalidade.
   async function importSessions(rows) {
-    setSessions(prev => {
+    setStoredSessions(prev => {
       const map = new Map(prev.map(s => [s.instanceId, s]));
       for (const row of rows) map.set(row.instanceId, { ...(map.get(row.instanceId) || {}), ...row });
       return Array.from(map.values());
@@ -528,7 +539,10 @@ function TrainingApp({ session, onSignOut }) {
             <HomeView sessions={sessions} recovery={recovery} setTab={setTab} photos={photos} />
           )}
           {tab === "today" && <TodayView sessions={sessions} onLog={setLogModal} onAnalyze={setAnalysisModal} />}
-          {tab === "calendar" && <CalendarView sessions={sessions} onLog={setLogModal} onAnalyze={setAnalysisModal} />}
+          {tab === "calendar" && (
+            <CalendarView sessions={sessions} onLog={setLogModal} onAnalyze={setAnalysisModal}
+              template={template} onSaveTemplateEntry={saveTemplateEntry} onRemoveTemplateEntry={removeTemplateEntry} />
+          )}
           {tab === "course" && <CourseView />}
           {tab === "progress" && <ProgressView sessions={sessions} />}
           {tab === "ai" && <AILabView sessions={sessions} recovery={recovery} />}
@@ -558,7 +572,8 @@ function TrainingApp({ session, onSignOut }) {
       </div>
 
       {logModal && (
-        <WorkoutLogModal session={logModal} onClose={() => setLogModal(null)} onSave={saveWorkoutLog} />
+        <WorkoutLogModal session={logModal} onClose={() => setLogModal(null)} onSave={saveWorkoutLog}
+          onPhotoUploaded={record => setPhotos(prev => [record, ...prev])} />
       )}
       {analysisModal && (
         <AIAnalysisModal session={analysisModal} onClose={() => setAnalysisModal(null)} />
@@ -1005,19 +1020,27 @@ function ActualSummary({ discipline, actual: a }) {
   if (a.cadence) items.push(`cad. ${a.cadence}`);
   if (a.rpe) items.push(`RPE ${a.rpe}`);
   return (
-    <div style={{ marginTop: 12, fontSize: 12.5, color: "var(--text)", display: "flex", flexWrap: "wrap", gap: 10 }}>
-      {items.map((it,i) => (
-        <span key={i} style={{ padding: "3px 8px", background: "var(--surface-2)", borderRadius: 3, border: "1px solid var(--line)" }}>{it}</span>
-      ))}
-      {a.isDemo && <DemoTag />}
+    <div style={{ marginTop: 12 }}>
+      <div style={{ fontSize: 12.5, color: "var(--text)", display: "flex", flexWrap: "wrap", gap: 10 }}>
+        {items.map((it,i) => (
+          <span key={i} style={{ padding: "3px 8px", background: "var(--surface-2)", borderRadius: 3, border: "1px solid var(--line)" }}>{it}</span>
+        ))}
+        {a.isDemo && <DemoTag />}
+      </div>
+      {a.photoUrl && (
+        <a href={a.photoUrl} target="_blank" rel="noreferrer" style={{ display: "inline-block", marginTop: 10 }}>
+          <img src={a.photoUrl} alt="Foto do treino" style={{ width: 96, height: 96, objectFit: "cover", borderRadius: 4, border: "1px solid var(--line)" }} />
+        </a>
+      )}
     </div>
   );
 }
 
 /* -------------------------------- Calendar --------------------------------- */
 
-function CalendarView({ sessions, onLog, onAnalyze }) {
+function CalendarView({ sessions, onLog, onAnalyze, template, onSaveTemplateEntry, onRemoveTemplateEntry }) {
   const [weekOffset, setWeekOffset] = useState(0);
+  const [editorOpen, setEditorOpen] = useState(false);
   const monday = addDays(getMonday(new Date()), weekOffset * 7);
   const today = todayISO();
 
@@ -1027,13 +1050,14 @@ function CalendarView({ sessions, onLog, onAnalyze }) {
     <div style={{ padding: "36px 28px 60px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24, flexWrap: "wrap", gap: 12 }}>
         <div className="icc-display" style={{ fontSize: 24 }}>Calendário</div>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
           <button className="icc-btn" onClick={() => setWeekOffset(o => o - 1)}><ChevronLeft size={14} /></button>
           <div style={{ fontSize: 13, color: "var(--text-muted)", minWidth: 130, textAlign: "center" }}>
             {formatDateShort(days[0])} – {formatDateShort(days[6])}
           </div>
           <button className="icc-btn" onClick={() => setWeekOffset(o => o + 1)}><ChevronRight size={14} /></button>
           {weekOffset !== 0 && <button className="icc-btn" onClick={() => setWeekOffset(0)}>Hoje</button>}
+          <button className="icc-btn" onClick={() => setEditorOpen(true)} style={{ marginLeft: 6 }}>Editar semana-modelo</button>
         </div>
       </div>
 
@@ -1069,6 +1093,91 @@ function CalendarView({ sessions, onLog, onAnalyze }) {
             </div>
           );
         })}
+      </div>
+
+      {editorOpen && (
+        <TemplateEditorModal template={template} onClose={() => setEditorOpen(false)}
+          onSave={onSaveTemplateEntry} onRemove={onRemoveTemplateEntry} />
+      )}
+    </div>
+  );
+}
+
+function emptyTemplateEntry() {
+  return { id: `t_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, day: 0, time: "06:00", discipline: "run", durationMin: 45, distanceKm: "", zone: "", desc: "" };
+}
+
+// Edição do calendário: cada linha é um item da semana-modelo (plan_template
+// no Supabase). Mudanças aqui alteram os treinos "planejados" de todo o
+// calendário — inclusive semanas passadas ainda não registradas e futuras.
+function TemplateEditorModal({ template, onClose, onSave, onRemove }) {
+  const [rows, setRows] = useState(() => template.map(t => ({ ...t, distanceKm: t.distanceKm ?? "", zone: t.zone ?? "", desc: t.desc ?? "" })));
+  const [saving, setSaving] = useState(null); // id sendo salvo
+
+  function patchRow(id, patch) {
+    setRows(prev => prev.map(r => r.id === id ? { ...r, ...patch } : r));
+  }
+
+  async function commitRow(id) {
+    const row = rows.find(r => r.id === id);
+    if (!row) return;
+    setSaving(id);
+    await onSave({
+      ...row,
+      durationMin: row.durationMin === "" ? null : +row.durationMin,
+      distanceKm: row.distanceKm === "" ? null : +row.distanceKm,
+      zone: row.zone || null,
+      desc: row.desc || "",
+      day: +row.day,
+    });
+    setSaving(null);
+  }
+
+  async function removeRow(id) {
+    setRows(prev => prev.filter(r => r.id !== id));
+    await onRemove(id);
+  }
+
+  function addRow() {
+    setRows(prev => [...prev, emptyTemplateEntry()]);
+  }
+
+  const sorted = [...rows].sort((a, b) => a.day - b.day || String(a.time).localeCompare(String(b.time)));
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div className="icc-card" style={{ width: "100%", maxWidth: 880, maxHeight: "88vh", display: "flex", flexDirection: "column" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: 18, borderBottom: "1px solid var(--line)" }}>
+          <div className="icc-display" style={{ fontSize: 18 }}>Editar semana-modelo</div>
+          <button className="icc-btn" onClick={onClose}><X size={14} /></button>
+        </div>
+        <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "12px 18px 0" }}>
+          Muda a estrutura do plano — passado ainda não registrado e futuro. Treinos já registrados não são afetados.
+        </div>
+        <div className="icc-scroll" style={{ flex: 1, overflowY: "auto", padding: 18, display: "flex", flexDirection: "column", gap: 10 }}>
+          {sorted.map(r => (
+            <div key={r.id} className="icc-card-soft" style={{ padding: 12, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <select className="icc-select" style={{ width: 110 }} value={r.day} onChange={e => patchRow(r.id, { day: e.target.value })}>
+                {DAY_LABELS.map((d, i) => <option key={i} value={i}>{d}</option>)}
+              </select>
+              <input className="icc-input" style={{ width: 90 }} type="time" value={r.time} onChange={e => patchRow(r.id, { time: e.target.value })} />
+              <select className="icc-select" style={{ width: 130 }} value={r.discipline} onChange={e => patchRow(r.id, { discipline: e.target.value })}>
+                {Object.keys(DISCIPLINES).map(k => <option key={k} value={k}>{DISCIPLINES[k].label}</option>)}
+              </select>
+              <input className="icc-input" style={{ width: 80 }} placeholder="min" value={r.durationMin ?? ""} onChange={e => patchRow(r.id, { durationMin: e.target.value })} />
+              <input className="icc-input" style={{ width: 80 }} placeholder="km" value={r.distanceKm} onChange={e => patchRow(r.id, { distanceKm: e.target.value })} />
+              <input className="icc-input" style={{ width: 70 }} placeholder="zona" value={r.zone} onChange={e => patchRow(r.id, { zone: e.target.value })} />
+              <input className="icc-input" style={{ flex: 1, minWidth: 140 }} placeholder="descrição" value={r.desc} onChange={e => patchRow(r.id, { desc: e.target.value })} />
+              <button className="icc-btn icc-btn-gold" onClick={() => commitRow(r.id)} disabled={saving === r.id}>
+                {saving === r.id ? <Loader2 size={13} /> : <Check size={13} />}
+              </button>
+              <button className="icc-btn" onClick={() => removeRow(r.id)} style={{ color: "var(--red)" }}><X size={13} /></button>
+            </div>
+          ))}
+          <button className="icc-btn" style={{ alignSelf: "flex-start", display: "flex", alignItems: "center", gap: 6 }} onClick={addRow}>
+            <PlusCircle size={14} /> Adicionar treino à semana-modelo
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1723,7 +1832,7 @@ ${text.slice(0, 12000)}`;
 
 /* ------------------------------ Workout log modal ---------------------------- */
 
-function WorkoutLogModal({ session: s, onClose, onSave }) {
+function WorkoutLogModal({ session: s, onClose, onSave, onPhotoUploaded }) {
   const isMiss = s.status === "missed";
   const [outcome, setOutcome] = useState(isMiss ? "missed" : (s.status === "partial" ? "partial" : "completed"));
   const seed = s.actual || {};
@@ -1735,6 +1844,9 @@ function WorkoutLogModal({ session: s, onClose, onSave }) {
     notes: seed.notes ?? "", nutrition: seed.nutrition ?? "",
     missedReason: s.missedReason ?? MISSED_REASONS[0], missedNote: s.missedNote ?? "",
   });
+  const [photoFile, setPhotoFile] = useState(null);
+  const [photoPreview, setPhotoPreview] = useState(seed.photoUrl || null);
+  const [saving, setSaving] = useState(false);
 
   const disc = s.discipline;
   const showDistance = disc !== "strength";
@@ -1742,10 +1854,28 @@ function WorkoutLogModal({ session: s, onClose, onSave }) {
   const showCadence = disc === "bike" || disc === "run";
   const showElevation = disc === "bike" || disc === "run";
 
-  function submit() {
+  function handlePhotoPick(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setPhotoFile(file);
+    setPhotoPreview(URL.createObjectURL(file));
+  }
+
+  async function submit() {
     if (outcome === "missed") {
       onSave(s.instanceId, { status: "missed", missedReason: f.missedReason, missedNote: f.missedNote });
       return;
+    }
+    setSaving(true);
+    let photoUrl = seed.photoUrl || null;
+    if (photoFile) {
+      try {
+        const blob = await compressImageToBlob(photoFile);
+        const category = { swim: "Natação", bike: "Bike", run: "Corrida", strength: "Musculação" }[disc] || "Preparação";
+        const record = await uploadPhoto(blob, category);
+        photoUrl = record.dataUrl;
+        onPhotoUploaded?.(record);
+      } catch (e) { console.error(e); }
     }
     const distanceKm = f.distanceKm === "" ? null : +f.distanceKm;
     const durationMin = f.durationMin === "" ? 0 : +f.durationMin;
@@ -1759,9 +1889,10 @@ function WorkoutLogModal({ session: s, onClose, onSave }) {
         power: f.power === "" ? null : +f.power,
         cadence: f.cadence === "" ? null : +f.cadence,
         elevationM: f.elevationM === "" ? null : +f.elevationM,
-        rpe: +f.rpe, sensation: f.sensation, notes: f.notes, nutrition: f.nutrition,
+        rpe: +f.rpe, sensation: f.sensation, notes: f.notes, nutrition: f.nutrition, photoUrl,
       },
     });
+    setSaving(false);
   }
 
   return (
@@ -1806,12 +1937,21 @@ function WorkoutLogModal({ session: s, onClose, onSave }) {
           </Field>
           <Field label="Alimentação / hidratação (opcional)"><input className="icc-input" value={f.nutrition} onChange={e=>setF(v=>({...v,nutrition:e.target.value}))} /></Field>
           <Field label="Observações"><textarea className="icc-textarea" rows={3} value={f.notes} onChange={e=>setF(v=>({...v,notes:e.target.value}))} /></Field>
+          <Field label="Foto do treino (opcional)">
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              {photoPreview && <img src={photoPreview} alt="preview" style={{ width: 56, height: 56, objectFit: "cover", borderRadius: 4, border: "1px solid var(--line)" }} />}
+              <label className="icc-btn" style={{ cursor: "pointer", margin: 0 }}>
+                {photoPreview ? "Trocar foto" : "Adicionar foto"}
+                <input type="file" accept="image/*" style={{ display: "none" }} onChange={handlePhotoPick} />
+              </label>
+            </div>
+          </Field>
         </div>
       )}
 
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 22 }}>
         <button className="icc-btn" onClick={onClose}>Cancelar</button>
-        <button className="icc-btn icc-btn-gold" onClick={submit}>Salvar registro</button>
+        <button className="icc-btn icc-btn-gold" onClick={submit} disabled={saving}>{saving ? "Salvando…" : "Salvar registro"}</button>
       </div>
     </ModalShell>
   );
