@@ -6,6 +6,9 @@ import {
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 import {
+  ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+} from "recharts";
+import {
   fetchSessions, upsertSession,
   fetchRecovery, bulkInsertRecovery, upsertRecovery,
   fetchPhotos, uploadPhoto, deletePhoto,
@@ -1448,6 +1451,8 @@ function ProgressView({ sessions }) {
         </div>
       </div>
 
+      <ProgressCharts sessions={sessions} />
+
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14 }}>
         {Object.entries(DISCIPLINES).map(([key, d]) => {
           const s = stats.byDiscipline[key];
@@ -1471,6 +1476,75 @@ function ProgressView({ sessions }) {
     </div>
   );
 }
+
+// Agrega km e FC média por semana, no total e por modalidade — só com
+// sessões que têm registro real (planejado sozinho não entra no gráfico).
+// hrKey é o campo de FC usada no "actual" de cada modalidade (todas usam hrAvg).
+function weeklyTrend(sessions, weeksBack, disciplineFilter) {
+  const thisMonday = getMonday(new Date());
+  const weeks = Array.from({ length: weeksBack }, (_, i) => addDays(thisMonday, -(weeksBack - 1 - i) * 7));
+
+  return weeks.map(monday => {
+    const start = toISODate(monday);
+    const end = toISODate(addDays(monday, 6));
+    let rel = sessions.filter(s => s.date >= start && s.date <= end && s.actual && (s.status === "completed" || s.status === "partial"));
+    if (disciplineFilter) rel = rel.filter(s => s.discipline === disciplineFilter);
+
+    const km = rel.reduce((a, s) => a + (s.actual.distanceKm || 0), 0);
+    const hrList = rel.filter(s => s.actual.hrAvg).map(s => s.actual.hrAvg);
+    const hrAvg = hrList.length ? Math.round(hrList.reduce((a, b) => a + b, 0) / hrList.length) : null;
+
+    return { label: formatDateShort(start), km: +km.toFixed(1), fcMedia: hrAvg, n: rel.length };
+  });
+}
+
+function ProgressCharts({ sessions }) {
+  const [scope, setScope] = useState("total"); // total | swim | bike | run | strength
+  const data = useMemo(() => weeklyTrend(sessions, 12, scope === "total" ? null : scope), [sessions, scope]);
+  const hasAnyKm = data.some(d => d.km > 0);
+
+  return (
+    <div className="icc-card" style={{ padding: 20, marginBottom: 22 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+        <div className="icc-label" style={{ margin: 0 }}>KM × FREQUÊNCIA CARDÍACA · ÚLTIMAS 12 SEMANAS</div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <button className="icc-btn" style={{ padding: "6px 11px", fontSize: 12, ...(scope === "total" ? { borderColor: "var(--gold)", color: "var(--gold)" } : {}) }} onClick={() => setScope("total")}>Total</button>
+          {Object.entries(DISCIPLINES).map(([key, d]) => (
+            <button key={key} className="icc-btn" style={{ padding: "6px 11px", fontSize: 12, ...(scope === key ? { borderColor: d.color, color: d.color } : {}) }} onClick={() => setScope(key)}>
+              {d.icon} {d.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {!hasAnyKm ? (
+        <div style={{ fontSize: 12.5, color: "var(--text-faint)", marginTop: 18, padding: "20px 0", textAlign: "center" }}>
+          Ainda não há treinos registrados com distância{scope !== "total" ? ` de ${DISCIPLINES[scope].label.toLowerCase()}` : ""} nas últimas 12 semanas.
+        </div>
+      ) : (
+        <div style={{ width: "100%", height: 260, marginTop: 14 }}>
+          <ResponsiveContainer>
+            <ComposedChart data={data} margin={{ top: 6, right: 6, left: -14, bottom: 0 }}>
+              <CartesianGrid stroke="var(--line-soft)" strokeDasharray="3 3" />
+              <XAxis dataKey="label" tick={{ fill: "var(--text-faint)", fontSize: 11 }} axisLine={{ stroke: "var(--line)" }} tickLine={false} />
+              <YAxis yAxisId="km" tick={{ fill: "var(--text-faint)", fontSize: 11 }} axisLine={false} tickLine={false} width={38} />
+              <YAxis yAxisId="fc" orientation="right" domain={[100, 180]} tick={{ fill: "var(--text-faint)", fontSize: 11 }} axisLine={false} tickLine={false} width={34} />
+              <Tooltip contentStyle={{ background: "var(--surface-2)", border: "1px solid var(--line)", borderRadius: 4, fontSize: 12.5 }}
+                labelStyle={{ color: "var(--text)" }} />
+              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <Bar yAxisId="km" dataKey="km" name="Km" fill={scope === "total" ? "var(--gold)" : DISCIPLINES[scope].color} radius={[3, 3, 0, 0]} opacity={0.75} />
+              <Line yAxisId="fc" dataKey="fcMedia" name="FC média (bpm)" stroke="var(--red)" strokeWidth={2} dot={{ r: 3 }} connectNulls />
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+      <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 10 }}>
+        Barras = km realizados por semana (eixo esquerdo). Linha = FC média dos treinos com esse dado (eixo direito). Semanas sem treinos registrados ficam sem ponto na linha.
+      </div>
+    </div>
+  );
+}
+
 
 function MiniStat({ label, value, color }) {
   return (
