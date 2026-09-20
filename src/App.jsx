@@ -1063,6 +1063,16 @@ function ActualSummary({ discipline, actual: a }) {
 
 /* -------------------------------- Calendar --------------------------------- */
 
+const PHASE_LABELS = {
+  "BASE": { label: "Base", color: "var(--swim)" },
+  "BUILD": { label: "Build", color: "var(--bike)" },
+  "PEAK": { label: "Peak", color: "var(--gold)" },
+  "TAPER": { label: "Taper", color: "var(--red)" },
+  "RACE WEEK": { label: "Race week", color: "var(--gold)" },
+};
+
+function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
 function CalendarView({ sessions, onLog, onAnalyze, template, onSaveTemplateEntry, onRemoveTemplateEntry, onAddAdHoc }) {
   const [weekOffset, setWeekOffset] = useState(0);
   const [editorOpen, setEditorOpen] = useState(false);
@@ -1071,9 +1081,20 @@ function CalendarView({ sessions, onLog, onAnalyze, template, onSaveTemplateEntr
 
   const days = Array.from({ length: 7 }, (_, i) => toISODate(addDays(monday, i)));
 
+  // Mês (ou meses, se a semana cruza a virada) exibido na semana em questão.
+  const d0 = fromISODate(days[0]), d6 = fromISODate(days[6]);
+  const m0 = capitalize(d0.toLocaleDateString("pt-BR", { month: "long" }));
+  const m6 = capitalize(d6.toLocaleDateString("pt-BR", { month: "long" }));
+  const monthLabel = m0 === m6 ? `${m0} de ${d0.getFullYear()}` : `${m0}/${m6} de ${d0.getFullYear()}`;
+
+  // Fase do ciclo de treino (periodização) na semana exibida — mesma lógica
+  // usada na Home (currentPhase), calculada a partir da distância até a prova.
+  const daysToRaceThisWeek = Math.ceil((fromISODate(RACE.date) - monday) / 86400000);
+  const phase = PHASE_LABELS[currentPhase(daysToRaceThisWeek)];
+
   return (
     <div style={{ padding: "36px 28px 60px" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24, flexWrap: "wrap", gap: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, flexWrap: "wrap", gap: 12 }}>
         <div className="icc-display" style={{ fontSize: 24 }}>Calendário</div>
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
           <button className="icc-btn" onClick={() => setWeekOffset(o => o - 1)}><ChevronLeft size={14} /></button>
@@ -1087,6 +1108,14 @@ function CalendarView({ sessions, onLog, onAnalyze, template, onSaveTemplateEntr
           </button>
           <button className="icc-btn" onClick={() => setEditorOpen(true)} style={{ marginLeft: 6 }}>Editar semana-modelo</button>
         </div>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 24 }}>
+        <span style={{ fontSize: 13, color: "var(--text-muted)" }}>{monthLabel}</span>
+        <span style={{ width: 4, height: 4, borderRadius: "50%", background: "var(--line)" }} />
+        <span style={{ fontSize: 11.5, color: phase.color, border: `1px solid ${phase.color}55`, background: `${phase.color}1a`, padding: "2px 9px", borderRadius: 20, letterSpacing: "0.03em" }}>
+          {phase.label.toUpperCase()}
+        </span>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12 }}>
@@ -1739,9 +1768,35 @@ function guessDiscipline(activityType) {
   return null;
 }
 
+// O Garmin exporta números em formatos diferentes dependendo do idioma da
+// conta: "6.00" (ponto decimal, formato EUA) ou "6,00" (vírgula decimal,
+// formato BR) — e às vezes com separador de milhar junto ("1.234,56" ou
+// "1,234.56"). Assumir sempre um dos dois formatos é o que causava o bug de
+// "6 km" virar "600 km" (um "6.00" em formato EUA sendo lido como se o ponto
+// fosse separador de milhar). Aqui a gente detecta pelo padrão da string.
 function parseGarminNumber(str) {
-  if (!str) return null;
-  const n = parseFloat(String(str).replace(/\./g, "").replace(",", "."));
+  if (str === null || str === undefined || str === "") return null;
+  let s = String(str).trim().replace(/[^\d.,-]/g, ""); // remove "km", espaços, unidades etc.
+  if (s === "") return null;
+
+  const hasComma = s.includes(",");
+  const hasDot = s.includes(".");
+
+  if (hasComma && hasDot) {
+    // Os dois aparecem: o que vem por último é o separador decimal.
+    if (s.lastIndexOf(",") > s.lastIndexOf(".")) {
+      s = s.replace(/\./g, "").replace(",", "."); // formato BR: 1.234,56
+    } else {
+      s = s.replace(/,/g, ""); // formato EUA: 1,234.56
+    }
+  } else if (hasComma) {
+    // Só vírgula — nesses campos (km, bpm, etc.) ela é sempre decimal, nunca
+    // separador de milhar (não faz sentido "6,000 km" ser "seis mil km").
+    s = s.replace(",", ".");
+  }
+  // Só ponto (ou nenhum separador): já está pronto pro parseFloat.
+
+  const n = parseFloat(s);
   return isNaN(n) ? null : n;
 }
 
