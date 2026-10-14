@@ -46,6 +46,11 @@ export async function fetchSessions() {
   return (data || []).map(rowToSession);
 }
 
+export async function deleteSession(instanceId) {
+  const { error } = await supabase.from("sessions").delete().eq("instance_id", instanceId);
+  if (error) throw error;
+}
+
 export async function bulkInsertSessions(sessions) {
   const rows = sessions.map(sessionToRow);
   const { error } = await supabase.from("sessions").upsert(rows, { onConflict: "instance_id" });
@@ -69,6 +74,7 @@ function rowToRecovery(r) {
     fatigue: r.fatigue,
     mood: r.mood,
     soreness: r.soreness,
+    restingHr: r.resting_hr,
     notes: r.notes,
     isDemo: r.is_demo,
   };
@@ -83,6 +89,7 @@ function recoveryToRow(date, log) {
     fatigue: log.fatigue,
     mood: log.mood,
     soreness: log.soreness,
+    resting_hr: log.restingHr ?? null,
     notes: log.notes,
     is_demo: log.isDemo || false,
   };

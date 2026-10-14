@@ -6,10 +6,10 @@ import {
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 import {
-  ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+  ComposedChart, LineChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from "recharts";
 import {
-  fetchSessions, upsertSession,
+  fetchSessions, upsertSession, deleteSession,
   fetchRecovery, bulkInsertRecovery, upsertRecovery,
   fetchPhotos, uploadPhoto, deletePhoto,
   fetchTemplate, bulkInsertTemplate, upsertTemplateEntry, deleteTemplateEntry,
@@ -346,12 +346,8 @@ function TrainingApp({ session, onSignOut }) {
         const loadedSessions = await fetchSessions();
         setStoredSessions(loadedSessions);
 
-        let loadedRecovery = await fetchRecovery();
-        if (Object.keys(loadedRecovery).length === 0) {
-          const demo = buildDemoRecovery();
-          await bulkInsertRecovery(demo);
-          loadedRecovery = demo;
-        }
+        // Só dados reais: nada de recovery inventado.
+        const loadedRecovery = await fetchRecovery();
         setRecovery(loadedRecovery);
 
         const loadedPhotos = await fetchPhotos();
@@ -360,7 +356,6 @@ function TrainingApp({ session, onSignOut }) {
         console.error(e);
         setSyncError("Não foi possível conectar ao Supabase. Verifique as variáveis de ambiente e a conexão.");
         setTemplate(DEFAULT_TEMPLATE);
-        setRecovery(buildDemoRecovery());
       }
       setReady(true);
     })();
@@ -456,6 +451,18 @@ function TrainingApp({ session, onSignOut }) {
     } catch (e) {
       console.error(e);
       setSyncError("Falha ao remover item da semana-modelo no Supabase.");
+    }
+  }
+
+  // Apaga o registro de um treino (extra/importado some; treino da semana-modelo
+  // volta a aparecer como "planejado").
+  async function removeSessionRecord(instanceId) {
+    try {
+      await deleteSession(instanceId);
+      setStoredSessions(prev => prev.filter(x => x.instanceId !== instanceId));
+    } catch (e) {
+      console.error(e);
+      setSyncError("Falha ao apagar o treino no Supabase.");
     }
   }
 
@@ -557,7 +564,7 @@ function TrainingApp({ session, onSignOut }) {
               onAddAdHoc={() => setAdHocModal(true)} />
           )}
           {tab === "course" && <CourseView />}
-          {tab === "progress" && <ProgressView sessions={sessions} />}
+          {tab === "progress" && <ProgressView sessions={sessions} recovery={recovery} onRemoveSession={removeSessionRecord} />}
           {tab === "ai" && <AILabView sessions={sessions} recovery={recovery} />}
           {tab === "recovery" && <RecoveryView recovery={recovery} onUpdate={updateRecovery} />}
           {tab === "import" && (
@@ -1517,7 +1524,7 @@ function AthleteFigure({ level }) {
   );
 }
 
-function ProgressView({ sessions }) {
+function ProgressView({ sessions, recovery, onRemoveSession }) {
   const [mode, setMode] = useState("week"); // week | block
   const today = new Date();
   const weekStart = toISODate(getMonday(today));
@@ -1552,7 +1559,9 @@ function ProgressView({ sessions }) {
         </div>
       </div>
 
-      <ProgressCharts sessions={sessions} />
+      <ProgressCharts sessions={sessions} onRemoveSession={onRemoveSession} />
+
+      <RestingHrCard recovery={recovery} />
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14 }}>
         {Object.entries(DISCIPLINES).map(([key, d]) => {
@@ -1578,44 +1587,82 @@ function ProgressView({ sessions }) {
   );
 }
 
-// Agrega km e FC média por semana, no total e por modalidade — só com
-// sessões que têm registro real (planejado sozinho não entra no gráfico).
-// hrKey é o campo de FC usada no "actual" de cada modalidade (todas usam hrAvg).
+// Treinos que contam nos gráficos: só registros reais (concluído/parcial),
+// nunca dados demonstrativos.
+function countedSessions(sessions) {
+  return sessions.filter(s => s.actual && !s.actual.isDemo && (s.status === "completed" || s.status === "partial"));
+}
+
+// Agrega km e FC média por semana (segunda a domingo), no total e por modalidade.
 function weeklyTrend(sessions, weeksBack, disciplineFilter) {
   const thisMonday = getMonday(new Date());
   const weeks = Array.from({ length: weeksBack }, (_, i) => addDays(thisMonday, -(weeksBack - 1 - i) * 7));
+  const base = countedSessions(sessions);
 
   return weeks.map(monday => {
     const start = toISODate(monday);
     const end = toISODate(addDays(monday, 6));
-    let rel = sessions.filter(s => s.date >= start && s.date <= end && s.actual && (s.status === "completed" || s.status === "partial"));
+    let rel = base.filter(s => s.date >= start && s.date <= end);
     if (disciplineFilter) rel = rel.filter(s => s.discipline === disciplineFilter);
 
-    const km = rel.reduce((a, s) => a + (s.actual.distanceKm || 0), 0);
-    const hrList = rel.filter(s => s.actual.hrAvg).map(s => s.actual.hrAvg);
+    const km = rel.reduce((a, s) => a + (+s.actual.distanceKm || 0), 0);
+    const hrList = rel.filter(s => s.actual.hrAvg).map(s => +s.actual.hrAvg);
     const hrAvg = hrList.length ? Math.round(hrList.reduce((a, b) => a + b, 0) / hrList.length) : null;
 
-    return { label: formatDateShort(start), km: +km.toFixed(1), fcMedia: hrAvg, n: rel.length };
+    return { label: `${formatDateShort(start)}–${formatDateShort(end)}`, km: +km.toFixed(1), fcMedia: hrAvg, n: rel.length };
   });
 }
 
-function ProgressCharts({ sessions }) {
+// Um ponto por treino, na data exata em que foi feito.
+function perWorkoutTrend(sessions, weeksBack, disciplineFilter) {
+  const start = toISODate(addDays(getMonday(new Date()), -(weeksBack - 1) * 7));
+  let rel = countedSessions(sessions).filter(s => s.date >= start);
+  if (disciplineFilter) rel = rel.filter(s => s.discipline === disciplineFilter);
+  return rel
+    .sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time))
+    .map(s => ({
+      label: `${formatDateShort(s.date)} ${DISCIPLINES[s.discipline]?.icon || ""}`,
+      km: +(+s.actual.distanceKm || 0).toFixed(2),
+      fcMedia: s.actual.hrAvg ? +s.actual.hrAvg : null,
+    }));
+}
+
+function ProgressCharts({ sessions, onRemoveSession }) {
   const [scope, setScope] = useState("total"); // total | swim | bike | run | strength
-  const data = useMemo(() => weeklyTrend(sessions, 12, scope === "total" ? null : scope), [sessions, scope]);
+  const [view, setView] = useState("week");    // week | workout
+  const [showList, setShowList] = useState(false);
+  const filter = scope === "total" ? null : scope;
+  const data = useMemo(
+    () => view === "week" ? weeklyTrend(sessions, 12, filter) : perWorkoutTrend(sessions, 12, filter),
+    [sessions, scope, view]
+  );
   const hasAnyKm = data.some(d => d.km > 0);
+
+  const listed = useMemo(() => {
+    const start = toISODate(addDays(getMonday(new Date()), -11 * 7));
+    return countedSessions(sessions)
+      .filter(s => s.date >= start && (!filter || s.discipline === filter))
+      .sort((a, b) => b.date.localeCompare(a.date));
+  }, [sessions, scope]);
+
+  const pill = (active, color) => ({ padding: "6px 11px", fontSize: 12, ...(active ? { borderColor: color || "var(--gold)", color: color || "var(--gold)" } : {}) });
 
   return (
     <div className="icc-card" style={{ padding: 20, marginBottom: 22 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
         <div className="icc-label" style={{ margin: 0 }}>KM × FREQUÊNCIA CARDÍACA · ÚLTIMAS 12 SEMANAS</div>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          <button className="icc-btn" style={{ padding: "6px 11px", fontSize: 12, ...(scope === "total" ? { borderColor: "var(--gold)", color: "var(--gold)" } : {}) }} onClick={() => setScope("total")}>Total</button>
-          {Object.entries(DISCIPLINES).map(([key, d]) => (
-            <button key={key} className="icc-btn" style={{ padding: "6px 11px", fontSize: 12, ...(scope === key ? { borderColor: d.color, color: d.color } : {}) }} onClick={() => setScope(key)}>
-              {d.icon} {d.label}
-            </button>
-          ))}
+        <div style={{ display: "flex", gap: 6 }}>
+          <button className="icc-btn" style={pill(view === "week")} onClick={() => setView("week")}>Por semana</button>
+          <button className="icc-btn" style={pill(view === "workout")} onClick={() => setView("workout")}>Por treino</button>
         </div>
+      </div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 12 }}>
+        <button className="icc-btn" style={pill(scope === "total")} onClick={() => setScope("total")}>Total</button>
+        {Object.entries(DISCIPLINES).map(([key, d]) => (
+          <button key={key} className="icc-btn" style={pill(scope === key, d.color)} onClick={() => setScope(key)}>
+            {d.icon} {d.label}
+          </button>
+        ))}
       </div>
 
       {!hasAnyKm ? (
@@ -1627,7 +1674,7 @@ function ProgressCharts({ sessions }) {
           <ResponsiveContainer>
             <ComposedChart data={data} margin={{ top: 6, right: 6, left: -14, bottom: 0 }}>
               <CartesianGrid stroke="var(--line-soft)" strokeDasharray="3 3" />
-              <XAxis dataKey="label" tick={{ fill: "var(--text-faint)", fontSize: 11 }} axisLine={{ stroke: "var(--line)" }} tickLine={false} />
+              <XAxis dataKey="label" tick={{ fill: "var(--text-faint)", fontSize: 10 }} axisLine={{ stroke: "var(--line)" }} tickLine={false} interval="preserveStartEnd" />
               <YAxis yAxisId="km" tick={{ fill: "var(--text-faint)", fontSize: 11 }} axisLine={false} tickLine={false} width={38} />
               <YAxis yAxisId="fc" orientation="right" domain={[100, 180]} tick={{ fill: "var(--text-faint)", fontSize: 11 }} axisLine={false} tickLine={false} width={34} />
               <Tooltip contentStyle={{ background: "var(--surface-2)", border: "1px solid var(--line)", borderRadius: 4, fontSize: 12.5 }}
@@ -1640,8 +1687,98 @@ function ProgressCharts({ sessions }) {
         </div>
       )}
       <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 10 }}>
-        Barras = km realizados por semana (eixo esquerdo). Linha = FC média dos treinos com esse dado (eixo direito). Semanas sem treinos registrados ficam sem ponto na linha.
+        {view === "week"
+          ? "Cada barra é uma semana (segunda a domingo) e soma os km de todos os treinos dela. "
+          : "Cada barra é um treino, na data em que foi feito. "}
+        A linha mostra a FC média dos treinos com esse dado (eixo direito). Só entram treinos concluídos ou parciais.
       </div>
+
+      <button className="icc-btn" style={{ marginTop: 14, fontSize: 12 }} onClick={() => setShowList(v => !v)}>
+        {showList ? "Esconder" : "Ver"} treinos contabilizados ({listed.length})
+      </button>
+      {showList && (
+        <div className="icc-scroll" style={{ marginTop: 10, maxHeight: 320, overflowY: "auto" }}>
+          {listed.length === 0 && <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>Nenhum treino registrado.</div>}
+          {listed.map(s => {
+            const km = +s.actual.distanceKm || 0;
+            const suspicious = km > ({ run: 60, bike: 300, swim: 10, strength: 0 }[s.discipline] ?? 300);
+            return (
+              <div key={s.instanceId} style={{ display: "flex", gap: 10, alignItems: "center", padding: "7px 0", borderBottom: "1px solid var(--line)", fontSize: 12.5 }}>
+                <div style={{ width: 78 }}>{formatDateShort(s.date)}</div>
+                <div style={{ width: 90 }}>{DISCIPLINES[s.discipline]?.icon} {DISCIPLINES[s.discipline]?.label}</div>
+                <div className="icc-num" style={{ width: 70, color: suspicious ? "var(--red)" : "var(--text)" }}>{km ? `${km} km` : "—"}</div>
+                <div style={{ width: 60, color: "var(--text-muted)" }}>{s.actual.durationMin ? `${s.actual.durationMin} min` : ""}</div>
+                <div style={{ flex: 1, fontSize: 11, color: suspicious ? "var(--red)" : "var(--text-faint)" }}>
+                  {suspicious ? "⚠ km parece errado" : (String(s.instanceId).startsWith("garmin_") || (s.actual.notes || "").includes("Garmin")) ? "Garmin" : "manual"}
+                </div>
+                {onRemoveSession && (
+                  <button className="icc-btn" style={{ padding: "3px 9px", fontSize: 11 }}
+                    onClick={() => { if (window.confirm(`Apagar o registro de ${formatDateShort(s.date)} (${DISCIPLINES[s.discipline]?.label}, ${km} km)?`)) onRemoveSession(s.instanceId); }}>
+                    Apagar
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// FC em repouso: uma medida por dia (registrada na aba Recovery).
+function RestingHrCard({ recovery }) {
+  const [days, setDays] = useState(60);
+  const data = useMemo(() => {
+    return Array.from({ length: days }, (_, i) => toISODate(addDays(new Date(), -(days - 1 - i))))
+      .map(d => ({ date: d, label: formatDateShort(d), fc: recovery?.[d]?.restingHr ? +recovery[d].restingHr : null }));
+  }, [recovery, days]);
+  const vals = data.filter(d => d.fc);
+  const avg = arr => arr.length ? Math.round(arr.reduce((a, b) => a + b.fc, 0) / arr.length) : null;
+  const last = vals.length ? vals[vals.length - 1] : null;
+  const avg7 = avg(vals.filter(d => d.date >= toISODate(addDays(new Date(), -6))));
+  const avgAll = avg(vals);
+  const lo = vals.length ? Math.min(...vals.map(d => d.fc)) - 4 : 40;
+  const hi = vals.length ? Math.max(...vals.map(d => d.fc)) + 4 : 80;
+
+  return (
+    <div className="icc-card" style={{ padding: 20, marginBottom: 22 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+        <div className="icc-label" style={{ margin: 0 }}>FC EM REPOUSO · DIÁRIA</div>
+        <div style={{ display: "flex", gap: 6 }}>
+          {[30, 60, 90].map(n => (
+            <button key={n} className="icc-btn" style={{ padding: "6px 11px", fontSize: 12, ...(days === n ? { borderColor: "var(--gold)", color: "var(--gold)" } : {}) }} onClick={() => setDays(n)}>{n} dias</button>
+          ))}
+        </div>
+      </div>
+      {vals.length === 0 ? (
+        <div style={{ fontSize: 12.5, color: "var(--text-faint)", marginTop: 18, padding: "20px 0", textAlign: "center" }}>
+          Ainda sem registros. Anote sua FC em repouso na aba Recovery (o ideal é medir ao acordar, antes de levantar).
+        </div>
+      ) : (
+        <>
+          <div style={{ display: "flex", gap: 28, marginTop: 14, flexWrap: "wrap" }}>
+            <MiniStat label={`Último (${formatDateShort(last.date)})`} value={`${last.fc} bpm`} />
+            <MiniStat label="Média 7 dias" value={avg7 ? `${avg7} bpm` : "—"} />
+            <MiniStat label={`Média ${days} dias`} value={`${avgAll} bpm`} />
+            <MiniStat label="Dias registrados" value={`${vals.length} / ${days}`} />
+          </div>
+          <div style={{ width: "100%", height: 220, marginTop: 14 }}>
+            <ResponsiveContainer>
+              <LineChart data={data} margin={{ top: 6, right: 6, left: -14, bottom: 0 }}>
+                <CartesianGrid stroke="var(--line-soft)" strokeDasharray="3 3" />
+                <XAxis dataKey="label" tick={{ fill: "var(--text-faint)", fontSize: 10 }} axisLine={{ stroke: "var(--line)" }} tickLine={false} interval="preserveStartEnd" minTickGap={28} />
+                <YAxis domain={[lo, hi]} tick={{ fill: "var(--text-faint)", fontSize: 11 }} axisLine={false} tickLine={false} width={38} />
+                <Tooltip contentStyle={{ background: "var(--surface-2)", border: "1px solid var(--line)", borderRadius: 4, fontSize: 12.5 }} labelStyle={{ color: "var(--text)" }} />
+                <Line dataKey="fc" name="FC repouso (bpm)" stroke="var(--red)" strokeWidth={2} dot={{ r: 3 }} connectNulls />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 10 }}>
+            Tendência de queda ao longo das semanas costuma indicar boa adaptação ao treino; subida repentina (junto com cansaço ou sono ruim) pode sinalizar que vale pegar mais leve.
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1660,37 +1797,56 @@ function MiniStat({ label, value, color }) {
 
 function RecoveryView({ recovery, onUpdate }) {
   const today = todayISO();
-  const log = recovery[today] || {};
-  const [form, setForm] = useState({
+  const [date, setDate] = useState(today);
+  const blank = (log) => ({
     sleepHours: log.sleepHours ?? "", sleepQuality: log.sleepQuality ?? 3,
     energy: log.energy ?? 3, fatigue: log.fatigue ?? 3, mood: log.mood ?? 3,
-    soreness: log.soreness ?? 1, notes: log.notes ?? "",
+    soreness: log.soreness ?? 1, notes: log.notes ?? "", restingHr: log.restingHr ?? "",
   });
+  const [form, setForm] = useState(blank(recovery[today] || {}));
+  const [savedMsg, setSavedMsg] = useState(false);
+
+  // Ao trocar a data, carrega o registro daquele dia (ou um formulário em branco).
+  useEffect(() => { setForm(blank(recovery[date] || {})); setSavedMsg(false); }, [date]);
 
   const last14 = Array.from({ length: 14 }, (_, i) => toISODate(addDays(new Date(), -13+i)))
     .map(d => ({ date: d, log: recovery[d] }))
     .filter(x => x.log);
 
   const avgSleep = last14.length ? (last14.reduce((a,x) => a + (x.log.sleepHours||0), 0) / last14.length).toFixed(1) : null;
+  const hrDays = last14.filter(x => x.log.restingHr);
+  const avgRhr = hrDays.length ? Math.round(hrDays.reduce((a,x) => a + +x.log.restingHr, 0) / hrDays.length) : null;
 
   function save() {
-    onUpdate(today, { ...form, sleepHours: form.sleepHours === "" ? null : +form.sleepHours });
+    onUpdate(date, {
+      ...form,
+      sleepHours: form.sleepHours === "" ? null : +form.sleepHours,
+      restingHr: form.restingHr === "" ? null : +form.restingHr,
+    });
+    setSavedMsg(true);
   }
 
   return (
     <div style={{ padding: "36px 28px 60px", maxWidth: 760 }}>
       <div className="icc-display" style={{ fontSize: 24, marginBottom: 6 }}>Recovery</div>
       <div style={{ fontSize: 13, color: "var(--text-muted)", marginBottom: 26 }}>
-        Sono, energia e sensação geral — sem diagnóstico, apenas registro.
+        Sono, FC em repouso, energia e sensação geral — sem diagnóstico, apenas registro.
       </div>
 
       <div className="icc-card" style={{ padding: 20, marginBottom: 22 }}>
-        <div className="icc-label" style={{ margin: 0 }}>REGISTRO DE HOJE</div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+          <div className="icc-label" style={{ margin: 0 }}>{date === today ? "REGISTRO DE HOJE" : `REGISTRO DE ${formatDateShort(date)}`}</div>
+          <input className="icc-input" type="date" style={{ width: 160 }} value={date} max={today}
+            onChange={e => e.target.value && setDate(e.target.value)} />
+        </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: 14, marginTop: 14 }}>
           <div>
+            <label className="icc-label">FC em repouso (bpm)</label>
+            <NumInput value={form.restingHr} onChange={v => setForm(f => ({ ...f, restingHr: v }))} placeholder="ex: 52" />
+          </div>
+          <div>
             <label className="icc-label">Horas de sono</label>
-            <input className="icc-input" type="number" step="0.1" value={form.sleepHours}
-              onChange={e => setForm(f => ({ ...f, sleepHours: e.target.value }))} placeholder="ex: 7.5" />
+            <NumInput decimal value={form.sleepHours} onChange={v => setForm(f => ({ ...f, sleepHours: v }))} placeholder="ex: 7.5" />
           </div>
           <SliderField label="Qualidade do sono" value={form.sleepQuality} onChange={v => setForm(f=>({...f, sleepQuality:v}))} />
           <SliderField label="Energia" value={form.energy} onChange={v => setForm(f=>({...f, energy:v}))} />
@@ -1698,17 +1854,22 @@ function RecoveryView({ recovery, onUpdate }) {
           <SliderField label="Humor" value={form.mood} onChange={v => setForm(f=>({...f, mood:v}))} />
           <SliderField label="Dor/desconforto" value={form.soreness} onChange={v => setForm(f=>({...f, soreness:v}))} />
         </div>
+        <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 10 }}>
+          Dica: meça a FC em repouso ao acordar, deitado, antes de levantar — no relógio Garmin aparece em "Frequência cardíaca em repouso".
+        </div>
         <div style={{ marginTop: 14 }}>
           <label className="icc-label">Observações</label>
           <textarea className="icc-textarea" rows={2} value={form.notes} onChange={e => setForm(f=>({...f, notes: e.target.value}))} />
         </div>
         <button className="icc-btn icc-btn-gold" style={{ marginTop: 16 }} onClick={save}>Salvar registro</button>
+        {savedMsg && <span style={{ marginLeft: 12, fontSize: 12.5, color: "var(--green)" }}>Salvo!</span>}
       </div>
 
       <div className="icc-card-soft" style={{ padding: 18 }}>
         <div className="icc-label" style={{ margin: 0 }}>ÚLTIMOS 14 DIAS</div>
         <div style={{ display: "flex", gap: 24, marginTop: 12, flexWrap: "wrap" }}>
           <MiniStat label="Sono médio" value={avgSleep ? `${avgSleep}h` : "—"} />
+          <MiniStat label="FC repouso média" value={avgRhr ? `${avgRhr} bpm` : "—"} />
           <MiniStat label="Dias registrados" value={`${last14.length} / 14`} />
         </div>
         {last14.some(x => x.log.isDemo) && <div style={{ marginTop: 10 }}><DemoTag /> <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>parte destes dados é demonstrativa</span></div>}
@@ -1732,6 +1893,10 @@ function SliderField({ label, value, onChange }) {
 // — mas sempre com uma tela de revisão antes de qualquer coisa ser salva.
 
 function parseCSV(text) {
+  text = String(text).replace(/^\uFEFF/, "");
+  // Garmin em português às vezes exporta com ";" em vez de ",".
+  const firstLine = text.split(/\r?\n/)[0] || "";
+  const delim = (firstLine.match(/;/g) || []).length > (firstLine.match(/,/g) || []).length ? ";" : ",";
   const rows = [];
   let row = [], field = "", inQuotes = false;
   for (let i = 0; i < text.length; i++) {
@@ -1742,7 +1907,7 @@ function parseCSV(text) {
       else field += c;
     } else {
       if (c === '"') inQuotes = true;
-      else if (c === ",") { row.push(field); field = ""; }
+      else if (c === delim) { row.push(field); field = ""; }
       else if (c === "\n" || c === "\r") {
         if (field !== "" || row.length > 0) { row.push(field); rows.push(row); row = []; field = ""; }
         if (c === "\r" && next === "\n") i++;
@@ -1803,7 +1968,11 @@ function parseGarminNumber(str) {
 function parseGarminDuration(str) {
   // aceita "1:05:32" ou "45:12" ou "45min"
   if (!str) return null;
-  const parts = String(str).split(":").map(Number);
+  const txt = String(str).trim();
+  const hm = txt.match(/^(?:(\d+)\s*h)?\s*(?:(\d+)\s*min)?$/i);
+  if (hm && (hm[1] || hm[2])) return (+hm[1] || 0) * 60 + (+hm[2] || 0);
+  if (/^\d+([.,]\d+)?$/.test(txt)) return Math.round(parseFloat(txt.replace(",", "."))); // só minutos
+  const parts = txt.split(":").map(x => Number(x.replace(",", ".")));
   if (parts.some(isNaN)) return null;
   if (parts.length === 3) return Math.round(parts[0] * 60 + parts[1] + parts[2] / 60);
   if (parts.length === 2) return Math.round(parts[0] + parts[1] / 60);
@@ -1830,36 +1999,101 @@ function ImportView({ sessions, onImportSessions, photos, onAddPhotos, onRemoveP
   );
 }
 
+// Normaliza nome de coluna: minúsculo, sem acento, sem espaços extras.
+function normHeader(h) {
+  return String(h || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+// Busca o valor de uma coluna por vários nomes possíveis (português/inglês).
+function pickCol(norm, names) {
+  for (const n of names) if (norm[n] !== undefined && norm[n] !== "") return norm[n];
+  return "";
+}
+const GARMIN_COLS = {
+  type: ["tipo de atividade", "activity type", "tipo"],
+  date: ["data", "date", "data e hora", "start time", "hora de inicio"],
+  time: ["tempo", "time", "duracao", "duration", "tempo decorrido", "elapsed time", "tempo em movimento", "moving time"],
+  dist: ["distancia", "distance"],
+  hr: ["fc media", "avg hr", "average hr", "frequencia cardiaca media", "average heart rate"],
+  power: ["potencia media", "avg power", "average power"],
+  elev: ["subida total", "total ascent", "ganho de elevacao"],
+  cad: ["cadencia media de corrida", "avg run cadence", "cadencia media de ciclismo", "avg bike cadence", "cadencia media", "avg cadence"],
+};
+function parseGarminDateTime(str) {
+  const m = String(str || "").match(/(\d{1,2}):(\d{2})/);
+  return m ? `${pad(+m[1])}:${m[2]}` : null;
+}
+// Distância máxima plausível por modalidade (km) — acima disso o app avisa.
+const MAX_KM = { run: 60, bike: 300, swim: 10, strength: 0 };
+
 function GarminCsvImport({ sessions, onImportSessions }) {
   const [rows, setRows] = useState([]); // review rows
   const [saved, setSaved] = useState(false);
+  const [info, setInfo] = useState("");
   const inputRef = useRef(null);
 
   function handleFile(e) {
     const file = e.target.files?.[0];
     if (!file) return;
-    setSaved(false);
+    setSaved(false); setInfo("");
     const reader = new FileReader();
     reader.onload = () => {
       const records = parseCSV(String(reader.result));
-      const built = records.map((r, i) => {
-        const activityType = r["Tipo de atividade"] || r["Activity Type"] || "";
-        const dateStr = r["Data"] || r["Date"] || "";
-        const date = parseGarminDate(dateStr);
-        const discipline = guessDiscipline(activityType) || "run";
-        const durationMin = parseGarminDuration(r["Tempo"] || r["Time"] || r["Duração"]);
-        const distanceKm = parseGarminNumber(r["Distância"] || r["Distance"]);
-        const hrAvg = parseGarminNumber(r["FC média"] || r["Avg HR"]);
-        const match = date ? sessions.find(s => s.date === date && s.discipline === discipline) : null;
-        return {
-          rowId: `g${i}`, include: !!date, date: date || "", discipline,
-          durationMin: durationMin || "", distanceKm: distanceKm || "", hrAvg: hrAvg || "",
-          matchInstanceId: match ? match.instanceId : null, activityType,
-        };
-      }).filter(r => r.date);
+      if (records.length === 0) { setRows([]); setInfo("Não consegui ler nenhuma linha desse arquivo. Confira se é o CSV exportado em Atividades do Garmin Connect."); return; }
+      const seen = new Set();
+      let skippedNoDate = 0;
+      const built = [];
+      records.forEach((raw, i) => {
+        const norm = {};
+        Object.keys(raw).forEach(k => { norm[normHeader(k)] = raw[k]; });
+        const activityType = pickCol(norm, GARMIN_COLS.type);
+        const dateRaw = pickCol(norm, GARMIN_COLS.date);
+        const date = parseGarminDate(dateRaw);
+        if (!date) { skippedNoDate++; return; }
+        const guessed = guessDiscipline(activityType);
+        const discipline = guessed || "run";
+        const durationMin = parseGarminDuration(pickCol(norm, GARMIN_COLS.time));
+        let distanceKm = parseGarminNumber(pickCol(norm, GARMIN_COLS.dist));
+        // Na natação o Garmin exporta a distância em METROS (ex: 1500) — convertemos para km.
+        if (discipline === "swim" && distanceKm !== null && distanceKm > 50) distanceKm = +(distanceKm / 1000).toFixed(3);
+        if (distanceKm !== null) distanceKm = +distanceKm.toFixed(2);
+        const hrAvg = parseGarminNumber(pickCol(norm, GARMIN_COLS.hr));
+        const power = parseGarminNumber(pickCol(norm, GARMIN_COLS.power));
+        const elevationM = parseGarminNumber(pickCol(norm, GARMIN_COLS.elev));
+        const cadence = parseGarminNumber(pickCol(norm, GARMIN_COLS.cad));
+        const startTime = parseGarminDateTime(dateRaw);
+
+        // ID estável (data + hora/duração + modalidade): importar o mesmo arquivo de novo
+        // atualiza o mesmo treino em vez de duplicar.
+        const stamp = startTime ? startTime.replace(":", "") : `${Math.round(durationMin || 0)}m`;
+        const garminId = `garmin_${date}_${stamp}_${discipline}`;
+        if (seen.has(garminId)) return; // linha repetida dentro do próprio arquivo
+        seen.add(garminId);
+
+        // Treino planejado do mesmo dia/modalidade que ainda não tem registro → vincula.
+        const match = sessions.find(s => s.date === date && s.discipline === discipline && !s.actual && s.status !== "missed");
+        // Já existe esse mesmo treino salvo (mesmo ID, ou mesmo dia/modalidade/km)?
+        const dup = sessions.find(s => s.instanceId === garminId)
+          || sessions.find(s => s.date === date && s.discipline === discipline && s.actual
+              && distanceKm !== null && Math.abs((+s.actual.distanceKm || 0) - distanceKm) < 0.05);
+        const maxKm = MAX_KM[discipline];
+        const suspicious = distanceKm !== null && maxKm > 0 && distanceKm > maxKm;
+        const unknownType = !guessed;
+
+        built.push({
+          rowId: `g${i}`, garminId, startTime, date, discipline, activityType, matchSession: match || null,
+          include: !dup && !unknownType && !suspicious,
+          note: dup ? "já registrado" : unknownType ? "tipo não reconhecido" : suspicious ? "km suspeito" : null,
+          durationMin: durationMin ?? "", distanceKm: distanceKm ?? "", hrAvg: hrAvg ?? "",
+          power: power ?? "", elevationM: elevationM ?? "", cadence: cadence ?? "",
+        });
+      });
       setRows(built);
+      const parts = [`${built.length} atividade(s) encontrada(s)`];
+      if (skippedNoDate) parts.push(`${skippedNoDate} linha(s) ignorada(s) por não terem data`);
+      setInfo(parts.join(" · "));
     };
     reader.readAsText(file, "utf-8");
+    e.target.value = ""; // permite escolher o mesmo arquivo de novo
   }
 
   function updateRow(rowId, patch) {
@@ -1868,16 +2102,29 @@ function GarminCsvImport({ sessions, onImportSessions }) {
 
   function save() {
     const toSave = rows.filter(r => r.include).map(r => {
-      const durationMin = +r.durationMin || 0, distanceKm = r.distanceKm === "" ? null : +r.distanceKm;
+      const durationMin = +r.durationMin || 0;
+      const distanceKm = r.distanceKm === "" ? null : +r.distanceKm;
       const pace = r.discipline === "run" ? formatPaceMinKm(durationMin, distanceKm) : r.discipline === "swim" ? formatSwimPace(durationMin, distanceKm) : null;
-      const speedKmh = r.discipline === "bike" && distanceKm ? +(distanceKm / (durationMin / 60)).toFixed(1) : null;
-      const day = (fromISODate(r.date).getDay() + 6) % 7;
-      const instanceId = r.matchInstanceId || `garmin_${r.date}_${r.discipline}_${r.rowId}`;
+      const speedKmh = r.discipline === "bike" && distanceKm && durationMin ? +(distanceKm / (durationMin / 60)).toFixed(1) : null;
+      const m = r.matchSession;
+      const day = m ? m.day : (fromISODate(r.date).getDay() + 6) % 7;
+      const num = v => (v === "" || v === null || v === undefined ? null : +v);
       return {
-        instanceId, templateId: null, date: r.date, day, time: "00:00", discipline: r.discipline,
-        durationMin: durationMin, distanceKm, zone: null, desc: "Importado do Garmin",
+        // Se casou com um treino planejado, mantém a identidade dele (id, template, horário, planejado)
+        // — assim ele vira "concluído" no calendário em vez de aparecer duplicado como "extra".
+        instanceId: m ? m.instanceId : r.garminId,
+        templateId: m ? m.templateId : null,
+        date: r.date, day, time: m ? m.time : (r.startTime || "00:00"), discipline: r.discipline,
+        durationMin: m ? m.durationMin : durationMin,
+        distanceKm: m ? m.distanceKm : distanceKm,
+        zone: m ? m.zone : null,
+        desc: m ? m.desc : "Importado do Garmin",
         status: "completed",
-        actual: { durationMin, distanceKm, pace, speedKmh, hrAvg: r.hrAvg === "" ? null : +r.hrAvg, power: null, cadence: null, elevationM: null, rpe: null, sensation: null, notes: `Importado do Garmin (${r.activityType})`, nutrition: "", isDemo: false },
+        actual: {
+          durationMin, distanceKm, pace, speedKmh, hrAvg: num(r.hrAvg), power: num(r.power),
+          cadence: num(r.cadence), elevationM: num(r.elevationM), rpe: null, sensation: null,
+          notes: `Importado do Garmin (${r.activityType})`, nutrition: "", isDemo: false,
+        },
         missedReason: null, missedNote: null,
       };
     });
@@ -1885,41 +2132,51 @@ function GarminCsvImport({ sessions, onImportSessions }) {
     setSaved(true);
   }
 
+  const selected = rows.filter(r => r.include).length;
+
   return (
     <div>
       <div className="icc-card" style={{ padding: 20, marginBottom: 18 }}>
         <div className="icc-label" style={{ margin: 0 }}>COMO EXPORTAR DO GARMIN CONNECT</div>
         <div style={{ fontSize: 12.5, color: "var(--text-muted)", marginTop: 8, lineHeight: 1.6 }}>
           O Garmin não oferece uma sincronização automática de graça para apps pessoais — a API oficial deles é só para empresas aprovadas.
-          O caminho que funciona: no site connect.garmin.com → "Atividades" → selecione as atividades → "Exportar CSV". Depois suba o
-          arquivo aqui. Pode repetir isso periodicamente (ex: 1x por semana).
+          O caminho que funciona: no site connect.garmin.com → "Atividades" → role a lista até carregar as que você quer → "Exportar CSV". Depois suba o
+          arquivo aqui. Pode repetir isso periodicamente: treinos já importados são reconhecidos e não duplicam.
         </div>
         <button className="icc-btn icc-btn-gold" style={{ marginTop: 14 }} onClick={() => inputRef.current?.click()}>Selecionar arquivo CSV</button>
-        <input ref={inputRef} type="file" accept=".csv" style={{ display: "none" }} onChange={handleFile} />
+        <input ref={inputRef} type="file" accept=".csv,text/csv" style={{ display: "none" }} onChange={handleFile} />
+        {info && <div style={{ fontSize: 12.5, color: "var(--text-muted)", marginTop: 12 }}>{info}</div>}
       </div>
 
       {rows.length > 0 && (
         <div className="icc-card" style={{ padding: 20 }}>
-          <div className="icc-label" style={{ margin: 0 }}>REVISAR ANTES DE SALVAR ({rows.length} atividades encontradas)</div>
-          <div className="icc-scroll" style={{ maxHeight: 420, overflowY: "auto", marginTop: 12 }}>
-            {rows.map(r => (
-              <div key={r.rowId} style={{ display: "flex", gap: 10, alignItems: "center", padding: "8px 0", borderBottom: "1px solid var(--line)" }}>
-                <input type="checkbox" checked={r.include} onChange={e => updateRow(r.rowId, { include: e.target.checked })} />
-                <div style={{ width: 90, fontSize: 12 }}>{r.date}</div>
-                <select className="icc-select" style={{ width: 120 }} value={r.discipline} onChange={e => updateRow(r.rowId, { discipline: e.target.value })}>
-                  {Object.keys(DISCIPLINES).map(k => <option key={k} value={k}>{DISCIPLINES[k].label}</option>)}
-                </select>
-                <input className="icc-input" style={{ width: 80 }} placeholder="min" value={r.durationMin} onChange={e => updateRow(r.rowId, { durationMin: e.target.value })} />
-                <input className="icc-input" style={{ width: 80 }} placeholder="km" value={r.distanceKm} onChange={e => updateRow(r.rowId, { distanceKm: e.target.value })} />
-                <input className="icc-input" style={{ width: 80 }} placeholder="FC" value={r.hrAvg} onChange={e => updateRow(r.rowId, { hrAvg: e.target.value })} />
-                <div style={{ fontSize: 11, color: r.matchInstanceId ? "var(--green)" : "var(--text-faint)" }}>
-                  {r.matchInstanceId ? "vincula a treino planejado" : "extra"}
-                </div>
-              </div>
-            ))}
+          <div className="icc-label" style={{ margin: 0 }}>REVISAR ANTES DE SALVAR ({selected} de {rows.length} marcadas)</div>
+          <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginTop: 6 }}>
+            Confira data, km e minutos — dá pra corrigir qualquer campo antes de salvar. Linhas "já registrado", de tipo desconhecido ou com km suspeito vêm desmarcadas.
           </div>
-          <button className="icc-btn icc-btn-gold" style={{ marginTop: 16 }} onClick={save}>Salvar selecionados</button>
-          {saved && <span style={{ marginLeft: 12, fontSize: 12.5, color: "var(--green)" }}>Salvo!</span>}
+          <div className="icc-scroll" style={{ maxHeight: 420, overflowY: "auto", marginTop: 12 }}>
+            {rows.map(r => {
+              const maxKm = MAX_KM[r.discipline];
+              const bad = r.distanceKm !== "" && maxKm > 0 && +r.distanceKm > maxKm;
+              return (
+                <div key={r.rowId} style={{ display: "flex", gap: 10, alignItems: "center", padding: "8px 0", borderBottom: "1px solid var(--line)", flexWrap: "wrap" }}>
+                  <input type="checkbox" checked={r.include} onChange={e => updateRow(r.rowId, { include: e.target.checked })} />
+                  <div style={{ width: 90, fontSize: 12 }}>{r.date}{r.startTime ? <span style={{ color: "var(--text-faint)" }}> {r.startTime}</span> : null}</div>
+                  <select className="icc-select" style={{ width: 120 }} value={r.discipline} onChange={e => updateRow(r.rowId, { discipline: e.target.value })}>
+                    {Object.keys(DISCIPLINES).map(k => <option key={k} value={k}>{DISCIPLINES[k].label}</option>)}
+                  </select>
+                  <NumInput style={{ width: 80 }} placeholder="min" value={r.durationMin} onChange={v => updateRow(r.rowId, { durationMin: v })} />
+                  <NumInput decimal style={{ width: 80, ...(bad ? { borderColor: "var(--red)" } : {}) }} placeholder="km" value={r.distanceKm} onChange={v => updateRow(r.rowId, { distanceKm: v })} />
+                  <NumInput style={{ width: 80 }} placeholder="FC" value={r.hrAvg} onChange={v => updateRow(r.rowId, { hrAvg: v })} />
+                  <div style={{ fontSize: 11, color: r.note ? "var(--amber)" : r.matchSession ? "var(--green)" : "var(--text-faint)" }}>
+                    {r.note || (r.matchSession ? "vincula a treino planejado" : "extra")}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <button className="icc-btn icc-btn-gold" style={{ marginTop: 16 }} onClick={save} disabled={selected === 0}>Salvar selecionados</button>
+          {saved && <span style={{ marginLeft: 12, fontSize: 12.5, color: "var(--green)" }}>Salvo! Veja em Progresso.</span>}
         </div>
       )}
     </div>
@@ -1931,8 +2188,8 @@ function parseGarminDate(str) {
   // formatos comuns: "2026-09-10 06:30:00", "10/09/2026 06:30", "2026-09-10"
   const m1 = str.match(/(\d{4})-(\d{2})-(\d{2})/);
   if (m1) return `${m1[1]}-${m1[2]}-${m1[3]}`;
-  const m2 = str.match(/(\d{2})\/(\d{2})\/(\d{4})/);
-  if (m2) return `${m2[3]}-${m2[2]}-${m2[1]}`;
+  const m2 = str.match(/(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{4})/);
+  if (m2) return `${m2[3]}-${pad(+m2[2])}-${pad(+m2[1])}`;
   return null;
 }
 
@@ -2123,12 +2380,12 @@ function WorkoutLogModal({ session: s, onClose, onSave, onPhotoUploaded }) {
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-            <Field label="Duração (min)"><input className="icc-input" type="number" value={f.durationMin} onChange={e=>setF(v=>({...v,durationMin:e.target.value}))} /></Field>
-            {showDistance && <Field label="Distância (km)"><input className="icc-input" type="number" step="0.01" value={f.distanceKm} onChange={e=>setF(v=>({...v,distanceKm:e.target.value}))} /></Field>}
-            <Field label="FC média (bpm)"><input className="icc-input" type="number" value={f.hrAvg} onChange={e=>setF(v=>({...v,hrAvg:e.target.value}))} /></Field>
-            {showPower && <Field label="Potência (W)"><input className="icc-input" type="number" value={f.power} onChange={e=>setF(v=>({...v,power:e.target.value}))} /></Field>}
-            {showCadence && <Field label="Cadência"><input className="icc-input" type="number" value={f.cadence} onChange={e=>setF(v=>({...v,cadence:e.target.value}))} /></Field>}
-            {showElevation && <Field label="Elevação (m)"><input className="icc-input" type="number" value={f.elevationM} onChange={e=>setF(v=>({...v,elevationM:e.target.value}))} /></Field>}
+            <Field label="Duração (min)"><NumInput value={f.durationMin} onChange={x=>setF(v=>({...v,durationMin:x}))} /></Field>
+            {showDistance && <Field label="Distância (km)"><NumInput decimal value={f.distanceKm} onChange={x=>setF(v=>({...v,distanceKm:x}))} /></Field>}
+            <Field label="FC média (bpm)"><NumInput value={f.hrAvg} onChange={x=>setF(v=>({...v,hrAvg:x}))} /></Field>
+            {showPower && <Field label="Potência (W)"><NumInput value={f.power} onChange={x=>setF(v=>({...v,power:x}))} /></Field>}
+            {showCadence && <Field label="Cadência"><NumInput value={f.cadence} onChange={x=>setF(v=>({...v,cadence:x}))} /></Field>}
+            {showElevation && <Field label="Elevação (m)"><NumInput value={f.elevationM} onChange={x=>setF(v=>({...v,elevationM:x}))} /></Field>}
           </div>
           <SliderField label="RPE (1-10)" value={f.rpe} onChange={v => setF(x=>({...x, rpe: v}))} />
           <Field label="Sensação geral">
@@ -2155,6 +2412,21 @@ function WorkoutLogModal({ session: s, onClose, onSave, onPhotoUploaded }) {
         <button className="icc-btn icc-btn-gold" onClick={submit} disabled={saving}>{saving ? "Salvando…" : "Salvar registro"}</button>
       </div>
     </ModalShell>
+  );
+}
+
+// Campo numérico digitável: usamos type="text" + inputMode em vez de
+// type="number", que em alguns navegadores trava a digitação quando o campo é
+// controlado pelo React. Aceita vírgula (vira ponto) e ignora letras.
+function NumInput({ value, onChange, decimal = false, style, placeholder }) {
+  return (
+    <input className="icc-input" type="text" inputMode={decimal ? "decimal" : "numeric"} autoComplete="off"
+      style={style} placeholder={placeholder} value={value ?? ""}
+      onChange={e => {
+        let v = e.target.value.replace(",", ".");
+        v = decimal ? v.replace(/[^\d.]/g, "").replace(/(\..*)\./g, "$1") : v.replace(/[^\d]/g, "");
+        onChange(v);
+      }} />
   );
 }
 
@@ -2331,12 +2603,12 @@ function AdHocWorkoutModal({ onClose, onSave, onPhotoUploaded }) {
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-          <Field label="Duração (min)"><input className="icc-input" type="number" value={f.durationMin} onChange={e=>setF(v=>({...v,durationMin:e.target.value}))} /></Field>
-          {showDistance && <Field label="Distância (km)"><input className="icc-input" type="number" step="0.01" value={f.distanceKm} onChange={e=>setF(v=>({...v,distanceKm:e.target.value}))} /></Field>}
-          <Field label="FC média (bpm)"><input className="icc-input" type="number" value={f.hrAvg} onChange={e=>setF(v=>({...v,hrAvg:e.target.value}))} /></Field>
-          {showPower && <Field label="Potência (W)"><input className="icc-input" type="number" value={f.power} onChange={e=>setF(v=>({...v,power:e.target.value}))} /></Field>}
-          {showCadence && <Field label="Cadência"><input className="icc-input" type="number" value={f.cadence} onChange={e=>setF(v=>({...v,cadence:e.target.value}))} /></Field>}
-          {showElevation && <Field label="Elevação (m)"><input className="icc-input" type="number" value={f.elevationM} onChange={e=>setF(v=>({...v,elevationM:e.target.value}))} /></Field>}
+          <Field label="Duração (min)"><NumInput value={f.durationMin} onChange={x=>setF(v=>({...v,durationMin:x}))} /></Field>
+          {showDistance && <Field label="Distância (km)"><NumInput decimal value={f.distanceKm} onChange={x=>setF(v=>({...v,distanceKm:x}))} /></Field>}
+          <Field label="FC média (bpm)"><NumInput value={f.hrAvg} onChange={x=>setF(v=>({...v,hrAvg:x}))} /></Field>
+          {showPower && <Field label="Potência (W)"><NumInput value={f.power} onChange={x=>setF(v=>({...v,power:x}))} /></Field>}
+          {showCadence && <Field label="Cadência"><NumInput value={f.cadence} onChange={x=>setF(v=>({...v,cadence:x}))} /></Field>}
+          {showElevation && <Field label="Elevação (m)"><NumInput value={f.elevationM} onChange={x=>setF(v=>({...v,elevationM:x}))} /></Field>}
         </div>
         <SliderField label="RPE (1-10)" value={f.rpe} onChange={v => setF(x=>({...x, rpe: v}))} />
         <Field label="Sensação geral">
